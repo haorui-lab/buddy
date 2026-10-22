@@ -312,6 +312,26 @@ describe('buddy actor parsers', () => {
     }))).toEqual({ sessionId: undefined, rawType: 'final', noise: true })
   })
 
+  it('keeps a long dsh bash command readable in the live panel', () => {
+    const command = `cd /Users/haorui/Code/mockService && grep -n "pickCasValue" -A 6 src/routes/auth.ts | sed -n '1,120p' && echo done`
+    const event = parseActorLine('dsh', JSON.stringify({
+      type: 'tool_call',
+      callId: 'c1',
+      tool: 'bash',
+      input: { command }
+    }))
+    expect(event.text).toBe(`🔧 bash ${command}`)
+    expect(event.text!.length).toBeGreaterThan(80)
+
+    const tooLong = parseActorLine('dsh', JSON.stringify({
+      type: 'tool_call',
+      callId: 'c2',
+      tool: 'bash',
+      input: { command: 'x'.repeat(300) }
+    }))
+    expect(tooLong.text).toBe(`🔧 bash ${'x'.repeat(200)}…`)
+  })
+
   it('extracts dsh final text and only falls back to streamed text when final is empty', () => {
     const events = [
       JSON.stringify({ type: 'session', sessionId: 's1', cwd: '/tmp/repo' }),

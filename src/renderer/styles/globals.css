@@ -338,7 +338,7 @@ body {
 
 /* ===== Running detail panel ===== */
 .running-detail-panel {
-  max-height: 33vh;
+  max-height: 50vh;
   min-height: 80px;
   display: flex;
   flex-direction: column;
@@ -353,7 +353,9 @@ body {
 .running-detail-content {
   flex: 1;
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 8px 12px;
+  scroll-padding-bottom: 8px;
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
   font-size: 12.5px;
   line-height: 1.55;

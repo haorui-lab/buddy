@@ -947,10 +947,12 @@ function textValue(value: unknown): string | undefined {
 function openCodeToolDetail(toolName: unknown, input: unknown): string | undefined {
   if (!input || typeof input !== 'object') return undefined
   const obj = input as Record<string, unknown>
-  // bash/shell: show command
+  // bash/shell: show command. Keep enough of it to identify the real target —
+  // 80 chars routinely cut at the file path, which reads like a truncated
+  // message in the live panel.
   if (toolName === 'bash' || toolName === 'shell') {
     const cmd = textValue(obj.command) ?? textValue(obj.cmd)
-    if (cmd) return truncate(cmd, 80)
+    if (cmd) return truncate(cmd, 200)
   }
   // file operations: show path
   const path = textValue(obj.path) ?? textValue(obj.file_path) ?? textValue(obj.file)

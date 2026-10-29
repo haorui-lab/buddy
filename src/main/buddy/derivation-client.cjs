@@ -40,7 +40,7 @@ async function main(args) {
   let body = { action }
   if (action === 'propose') {
     const file = rest[0]
-    if (!file) throw new Error('Usage: propose spec.json')
+    if (!file) throw new Error('Usage: propose /path/to/derivation-spec.json')
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
     body.specs = Array.isArray(parsed) ? parsed : parsed.specs
   } else if (action === 'decide') {

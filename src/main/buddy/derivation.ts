@@ -154,6 +154,7 @@ export function formatDerivationSection(input: {
   }>
   workDir?: string
   session?: Record<string, string>
+  specFile: string
 }): string {
   const lines = [
     input.prompt.trim(),
@@ -192,7 +193,7 @@ export function formatDerivationSection(input: {
     '派生操作（只记录你自己的决定，不能代替另一位 Actor）：',
     '有些 Actor 的登录 shell 不会继承环境变量。请原样执行下面的命令，不要改成只依赖 $BUDDY_DERIVATION_NODE。',
     command('status'),
-    command('propose spec.json'),
+    command(`propose ${shellQuote(input.specFile)}`),
     command('decide agree 理由'),
     command('decide disagree 理由'),
     command('create'),
@@ -203,12 +204,17 @@ export function formatDerivationSection(input: {
     command('waive CHILD_TASK_ID 原因'),
     command('restart CHILD_TASK_ID'),
     '',
-    'spec.json 形如 {"specs":[{"key":"api","title":"标题","goal":"目标","scope":"范围","context":"上下文","dependencies":[],"deliverables":"交付物","acceptance":"验收条件"}]}。',
+    `方案写到 ${input.specFile}。不要把方案文件写进当前工作目录，未跟踪文件会让创建被拒绝。`,
+    '文件内容形如 {"specs":[{"key":"api","title":"标题","goal":"目标","scope":"范围","context":"上下文","dependencies":[],"deliverables":"交付物","acceptance":"验收条件"}]}。',
     '独立子任务会真正并行启动。修改方案后必须双方重新确认。重复创建不会产生第二份任务。',
     '已取消的子任务会挡住父任务结束，除非父任务用 waive 写明原因并解除必要性。失败的子任务用 restart 重新启动；要放弃它，先取消再用 waive。',
     '子任务必须先 submit，再由双方确认结束。没有交付记录时，不会进入父任务验收。'
   )
   return lines.filter(line => line !== undefined).join('\n')
+}
+
+function isEnoent(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT'
 }
 
 function shellQuote(value: string): string {
@@ -376,7 +382,8 @@ export class DerivationService {
       actors: { implementer: implementerActor(settings), reviewer: reviewerActor(settings) },
       children,
       workDir: state.work_dir,
-      session
+      session,
+      specFile: join(this.store.taskDirectory(taskId, workspaceKey), 'artifacts', 'derivation-spec.json')
     })
   }
 
@@ -506,7 +513,11 @@ export class DerivationService {
         await stopIfParentClosed()
         const childId = idByKey.get(spec.key)!
         const dependsOn = spec.dependencies.map(key => idByKey.get(key)!).filter(Boolean)
-        const existing = await this.store.readTaskState(childId, workspaceKey).catch(() => null)
+        const record = await this.readChildRecord(childId, workspaceKey)
+        if (record.kind === 'unreadable') {
+          throw new Error(`子任务 ${childId} 的状态无法读取，工作目录已保留。请先修好状态文件，再继续。`)
+        }
+        const existing = record.kind === 'present' ? record.state : null
         if (existing) {
           if (existing.parent_task_id !== taskId || existing.spec_key !== spec.key) {
             throw new Error(`子任务标识已被占用：${childId}`)
@@ -985,6 +996,54 @@ export class DerivationService {
     if (ready.length) await this.kickAll(ready, workspaceKey)
   }
 
+  private async readChildRecord(
+    taskId: string,
+    workspaceKey: string
+  ): Promise<{ kind: 'missing' } | { kind: 'unreadable' } | { kind: 'present'; state: TaskState }> {
+    try {
+      return { kind: 'present', state: await this.store.readTaskState(taskId, workspaceKey) }
+    } catch (error) {
+      if (isEnoent(error)) return { kind: 'missing' }
+      return { kind: 'unreadable' }
+    }
+  }
+
+  /**
+   * 只有「没有任务记录、工作区干净、提交就是父任务 HEAD」的目录才能回收。
+   * 状态损坏、未提交文件、或另有提交，都保留目录。不用 --force。
+   */
+  private async reclaimOrphanWorktree(
+    base: string,
+    dir: string,
+    taskId: string,
+    workspaceKey: string
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const record = await this.readChildRecord(taskId, workspaceKey)
+    if (record.kind === 'unreadable') {
+      return { ok: false, reason: `子任务 ${taskId} 的状态无法读取，工作目录已保留：${dir}` }
+    }
+    if (record.kind === 'present') {
+      return { ok: false, reason: `无法从父任务工作版本创建工作目录：${dir} 已有任务记录` }
+    }
+    const status = await runGit(dir, ['status', '--porcelain'])
+    if (!status.ok) {
+      return { ok: false, reason: `无法从父任务工作版本创建工作目录，也不能确认已有目录可以删除：${dir}` }
+    }
+    if (status.stdout.trim()) {
+      return { ok: false, reason: `已有工作目录里还有未提交的内容，不能删除：${dir}：${status.stdout.trim().slice(0, 300)}` }
+    }
+    const baseHead = await runGit(base, ['rev-parse', 'HEAD'])
+    const dirHead = await runGit(dir, ['rev-parse', 'HEAD'])
+    if (!baseHead.ok || !dirHead.ok || baseHead.stdout !== dirHead.stdout) {
+      return { ok: false, reason: `已有工作目录的提交和父任务不一致，目录已保留：${dir}` }
+    }
+    const removed = await runGit(base, ['worktree', 'remove', dir])
+    if (!removed.ok) {
+      return { ok: false, reason: `无法回收已有工作目录，目录已保留：${dir}：${removed.stderr || removed.stdout}` }
+    }
+    return { ok: true }
+  }
+
   private async allocateWorkDir(
     parent: { repo_root?: string; work_dir?: string },
     workspaceKey: string,
@@ -1001,11 +1060,9 @@ export class DerivationService {
       let added = await runGit(base, ['worktree', 'add', '--detach', dir, 'HEAD'])
       const occupied = `${added.stderr}\n${added.stdout}`
       if (!added.ok && /already exists|already used|file exists/i.test(occupied)) {
-        const recorded = await this.store.readTaskState(taskId, workspaceKey).catch(() => null)
-        if (!recorded) {
-          await runGit(base, ['worktree', 'remove', '--force', dir])
-          added = await runGit(base, ['worktree', 'add', '--detach', dir, 'HEAD'])
-        }
+        const reclaimed = await this.reclaimOrphanWorktree(base, dir, taskId, workspaceKey)
+        if (!reclaimed.ok) throw new Error(reclaimed.reason)
+        added = await runGit(base, ['worktree', 'add', '--detach', dir, 'HEAD'])
       }
       if (!added.ok) {
         throw new Error(`无法从父任务工作版本创建工作目录：${added.stderr || added.stdout || 'git worktree add 失败'}`)

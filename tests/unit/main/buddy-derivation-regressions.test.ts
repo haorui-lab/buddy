@@ -130,6 +130,7 @@ describe('derivation review regressions', () => {
     await ctx.service.decide('root', ctx.ws, 'claude', 'agree', 'yes')
     await ctx.service.decide('root', ctx.ws, 'codex', 'agree', 'yes')
     await expect(ctx.service.create('root', ctx.ws)).rejects.toThrow(/工作版本/)
+    expect(await readFile(join(dest, 'block.txt'), 'utf8')).toBe('occupied')
     expect((await ctx.store.getTasks()).some(task => task.task_id === childId)).toBe(false)
   })
 
@@ -435,6 +436,69 @@ describe('derivation review regressions', () => {
     const child = await ctx.store.readTaskState(created.task_ids[0], ctx.ws)
     expect(await readFile(join(child.work_dir!, 'base.txt'), 'utf8')).toBe('old')
     expect((await ctx.store.getTasks()).filter(task => task.parent_task_id === 'root')).toHaveLength(1)
+  })
+
+  it('keeps an unrecorded worktree that still has uncommitted files', async () => {
+    const repo = await gitRepo()
+    const ctx = await setup(repo)
+    const childId = derivedTaskId('root', 'child')
+    const dest = join(ctx.store.dataRoot, 'runtime', 'worktrees', ctx.ws, childId)
+    await mkdir(join(ctx.store.dataRoot, 'runtime', 'worktrees', ctx.ws), { recursive: true })
+    await git(repo, ['worktree', 'add', '--detach', dest, 'HEAD'])
+    await writeFile(join(dest, 'recovery.txt'), 'only copy')
+    await expect(derive(ctx, 'root')).rejects.toThrow(/不能删除/)
+    expect(await readFile(join(dest, 'recovery.txt'), 'utf8')).toBe('only copy')
+    expect((await ctx.store.getTasks()).some(task => task.task_id === childId)).toBe(false)
+  })
+
+  it('keeps an unrecorded worktree whose commit is not the parent HEAD', async () => {
+    const repo = await gitRepo()
+    const ctx = await setup(repo)
+    const childId = derivedTaskId('root', 'child')
+    const dest = join(ctx.store.dataRoot, 'runtime', 'worktrees', ctx.ws, childId)
+    await mkdir(join(ctx.store.dataRoot, 'runtime', 'worktrees', ctx.ws), { recursive: true })
+    await git(repo, ['worktree', 'add', '--detach', dest, 'HEAD'])
+    await writeFile(join(dest, 'extra.txt'), 'committed only here')
+    await git(dest, ['add', 'extra.txt'])
+    await git(dest, ['commit', '-m', 'extra'])
+    const head = await git(dest, ['rev-parse', 'HEAD'])
+    await expect(derive(ctx, 'root')).rejects.toThrow(/不一致/)
+    expect(await git(dest, ['rev-parse', 'HEAD'])).toBe(head)
+    expect(await readFile(join(dest, 'extra.txt'), 'utf8')).toBe('committed only here')
+  })
+
+  it('does not delete child work when the task state cannot be read', async () => {
+    const ctx = await setup(await gitRepo())
+    const [child] = await derive(ctx, 'root')
+    const state = await ctx.store.readTaskState(child, ctx.ws)
+    await writeFile(join(state.work_dir!, 'unfinished.txt'), 'keep me')
+    await writeFile(join(ctx.store.taskDirectory(child, ctx.ws), 'state.json'), '{broken')
+    await ctx.service.propose('root', ctx.ws, 'claude', [spec()])
+    await ctx.service.decide('root', ctx.ws, 'claude', 'agree', 'yes')
+    await ctx.service.decide('root', ctx.ws, 'codex', 'agree', 'yes')
+    await expect(ctx.service.create('root', ctx.ws)).rejects.toThrow(/无法读取/)
+    expect(await readFile(join(state.work_dir!, 'unfinished.txt'), 'utf8')).toBe('keep me')
+    expect(await readFile(join(ctx.store.taskDirectory(child, ctx.ws), 'state.json'), 'utf8')).toBe('{broken')
+  })
+
+  it('creates a child when the proposal file is written where the prompt says', async () => {
+    const repo = await gitRepo()
+    const ctx = await setup(repo)
+    const section = await ctx.service.promptSection('root', ctx.ws)
+    const match = section.match(/propose '([^']+)'/)
+    expect(match?.[1]).toBe(join(ctx.store.taskDirectory('root', ctx.ws), 'artifacts', 'derivation-spec.json'))
+    expect(section).not.toContain('propose spec.json')
+    expect(section).toContain('不要把方案文件写进当前工作目录')
+    const specPath = match![1]
+    await writeFile(specPath, JSON.stringify({ specs: [spec()] }))
+    const parsed = JSON.parse(await readFile(specPath, 'utf8')) as { specs: DerivationSpec[] }
+    await ctx.service.propose('root', ctx.ws, 'claude', parsed.specs)
+    await ctx.service.decide('root', ctx.ws, 'claude', 'agree', 'yes')
+    await ctx.service.decide('root', ctx.ws, 'codex', 'agree', 'yes')
+    const created = await ctx.service.create('root', ctx.ws)
+    expect(created.task_ids).toHaveLength(1)
+    expect(await access(join(repo, 'spec.json')).then(() => true, () => false)).toBe(false)
+    expect(await git(repo, ['status', '--porcelain'])).toBe('')
   })
 
   it('keeps sidebar children inside their own project', () => {

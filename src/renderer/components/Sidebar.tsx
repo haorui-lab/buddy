@@ -531,6 +531,7 @@ function ChatSidebar({
                     {!collapsedTaskIds.includes(task.task_id) && (
                       <NestedTaskList
                         parentId={task.task_id}
+                        workspaceKey={task.workspace_key}
                         depth={1}
                         tasks={tasks}
                         selectedTaskId={selectedTaskId}
@@ -612,7 +613,7 @@ function ChatSidebar({
                       const unread = isTaskUnread(task, selectedTaskId)
                       const displayName = displayNameForTask(task, taskNames)
                       const isPinned = pinnedTaskIds.includes(task.task_id)
-                      const childCount = taskChildren(tasks, task.task_id).length
+                      const childCount = taskChildren(tasks, task.task_id, task.workspace_key).length
                       return (
                         <div key={task.task_id}>
                         <div
@@ -681,6 +682,7 @@ function ChatSidebar({
                         {!collapsedTaskIds.includes(task.task_id) && (
                           <NestedTaskList
                             parentId={task.task_id}
+                            workspaceKey={task.workspace_key}
                             depth={1}
                             tasks={tasks}
                             selectedTaskId={selectedTaskId}
@@ -883,6 +885,7 @@ function FolderIcon({ isOpen }: { isOpen: boolean }) {
 
 function NestedTaskList({
   parentId,
+  workspaceKey,
   depth,
   tasks,
   selectedTaskId,
@@ -895,6 +898,7 @@ function NestedTaskList({
   t
 }: {
   parentId: string
+  workspaceKey: string
   depth: number
   tasks: Task[]
   selectedTaskId: string | null
@@ -906,7 +910,7 @@ function NestedTaskList({
   onOpenMenu: (task: Task, displayName: string, isPinned: boolean, anchor: SidebarMenuAnchor) => void
   t: TFunction
 }) {
-  const children = taskChildren(tasks, parentId)
+  const children = taskChildren(tasks, parentId, workspaceKey)
   if (children.length === 0) return null
   return (
     <>
@@ -915,7 +919,7 @@ function NestedTaskList({
         const unread = isTaskUnread(task, selectedTaskId)
         const displayName = displayNameForTask(task, taskNames)
         const isPinned = pinnedTaskIds.includes(task.task_id)
-        const nested = taskChildren(tasks, task.task_id)
+        const nested = taskChildren(tasks, task.task_id, task.workspace_key)
         const collapsed = collapsedTaskIds.includes(task.task_id)
         return (
           <div key={task.task_id}>
@@ -953,6 +957,7 @@ function NestedTaskList({
             {!collapsed && (
               <NestedTaskList
                 parentId={task.task_id}
+                workspaceKey={task.workspace_key}
                 depth={depth + 1}
                 tasks={tasks}
                 selectedTaskId={selectedTaskId}

@@ -40,9 +40,9 @@ export function displayNameForTask(task: Task, taskNames?: TaskNames): string {
   return task.task_id
 }
 
-export function taskChildren(tasks: Task[], parentId: string): Task[] {
+export function taskChildren(tasks: Task[], parentId: string, workspaceKey: string): Task[] {
   return tasks
-    .filter(task => task.parent_task_id === parentId)
+    .filter(task => task.parent_task_id === parentId && task.workspace_key === workspaceKey)
     .sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''))
 }
 

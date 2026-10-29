@@ -52,6 +52,15 @@ async function agree(service: DerivationService, taskId: string, workspaceKey: s
   await service.decide(taskId, workspaceKey, 'codex', 'agree', '可以')
 }
 
+async function markAwaiting(store: BuddyStore, taskId: string, workspaceKey: string) {
+  await store.updateTaskState(taskId, workspaceKey, current => ({
+    ...current,
+    status: 'AWAITING_ACCEPTANCE',
+    active_run: null,
+    updated_at: new Date().toISOString()
+  }))
+}
+
 describe('task derivation', () => {
   it('rejects a proposal when the task is not allowed to derive', async () => {
     const root = await mkdtemp(join(tmpdir(), 'buddy-derive-deny-'))
@@ -106,6 +115,7 @@ describe('task derivation', () => {
     expect((await store.readTaskState(beta, ws)).dependency_blocked).toBe(true)
     const child = await store.readTaskState(alpha, ws)
     await service.submit(alpha, ws, 'claude', { version: 'unversioned', artifacts: 'a', verification: 'ok', open_issues: '' })
+    await markAwaiting(store, alpha, ws)
     await service.review('root-task', ws, 'codex', alpha, 'accept', '通过')
     expect(started).toEqual([alpha, beta])
     expect((await store.readTaskState(beta, ws)).status).toBe('RUNNING_CLAUDE')
@@ -155,18 +165,22 @@ describe('task derivation', () => {
     const child = await store.readTaskState(task_ids[0], ws)
     const head = await git(child.work_dir!, ['rev-parse', 'HEAD'])
     await service.submit(task_ids[0], ws, 'claude', { version: 'not-the-head', artifacts: 'readme.txt', verification: '未跑', open_issues: '' })
+    await markAwaiting(store, task_ids[0], ws)
     await expect(service.review('root-task', ws, 'codex', task_ids[0], 'accept', '看起来行')).rejects.toThrow(/不一致/)
     await service.submit(task_ids[0], ws, 'claude', { version: head, artifacts: 'readme.txt', verification: 'git status 干净', open_issues: '无' })
+    await markAwaiting(store, task_ids[0], ws)
     await service.review('root-task', ws, 'codex', task_ids[0], 'reject', '测试没跑')
     await vi.waitFor(async () => {
       expect((await store.readTaskState(task_ids[0], ws)).status.startsWith('RUNNING')).toBe(true)
     })
     await service.submit(task_ids[0], ws, 'claude', { version: head, artifacts: 'readme.txt', verification: '已补测试', open_issues: '无' })
     await writeFile(join(child.work_dir!, 'scratch.txt'), '未跟踪\n')
+    await markAwaiting(store, task_ids[0], ws)
     await expect(service.review('root-task', ws, 'codex', task_ids[0], 'accept', '通过')).rejects.toThrow(/未提交/)
     expect((await store.readTaskState(task_ids[0], ws)).status).not.toBe('DONE')
     await rm(join(child.work_dir!, 'scratch.txt'))
     await writeFile(join(repo, 'parent-only.txt'), '只在父仓库\n')
+    await markAwaiting(store, task_ids[0], ws)
     await service.review('root-task', ws, 'codex', task_ids[0], 'accept', '通过')
     expect((await store.readTaskState(task_ids[0], ws)).status).toBe('DONE')
     expect((await store.readTaskState(task_ids[0], ws)).acceptance?.version).toBe(head)
@@ -298,6 +312,7 @@ describe('task derivation', () => {
     await store.updateTaskState(childId, ws, current => ({
       ...current,
       status: 'AWAITING_ACCEPTANCE',
+      active_run: null,
       delivery: null,
       updated_at: new Date().toISOString()
     }))

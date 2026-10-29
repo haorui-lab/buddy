@@ -453,10 +453,12 @@ export class BuddyRunner {
     if (seen.has(taskId)) return
     seen.add(taskId)
     const existing = await this.store.readTaskState(taskId, workspaceKey).catch(() => null)
-    if (!existing || existing.status === 'CANCELLED' || existing.status === 'DONE') return
-    for (const childId of existing.child_task_ids ?? []) {
-      await this.cancelTask(childId, workspaceKey, seen)
+    if (!existing || existing.status === 'DONE') return
+    if (existing.status === 'CANCELLED') {
+      await this.cancelOutstandingChildren(taskId, workspaceKey, existing.child_task_ids ?? [], seen)
+      return
     }
+    await this.cancelOutstandingChildren(taskId, workspaceKey, existing.child_task_ids ?? [], seen)
     const key = this.runControllerKey(workspaceKey, taskId)
     if (this.cancelling.has(key)) throw new Error('Task cancellation is already in progress')
     this.cancelling.add(key)
@@ -473,7 +475,34 @@ export class BuddyRunner {
       if (!cleaned) throw new Error('Task services could not be cleaned up; task records were preserved')
       await this.store.appendTaskEvent(taskId, workspaceKey, { type: 'task.cancelled', payload: {} })
       this.onTaskTerminal?.(workspaceKey)
+      // Wake a waiting parent only when this child was cancelled on its own.
+      // A parent already in `seen` is part of the same cascade and must not be restarted.
+      if (existing.parent_task_id && !seen.has(existing.parent_task_id)) {
+        await this.derivation.notifyParent(
+          taskId,
+          workspaceKey,
+          `子任务 ${existing.title || taskId} 已取消。要继续的话，父任务用 waive ${taskId} 写明原因，把它从必要子任务里去掉。`,
+          true
+        )
+      }
     } finally { this.cancelling.delete(key) }
+  }
+
+  /** 取消已经返回之后才落盘的子任务，下一次取消仍然要收掉。 */
+  private async cancelOutstandingChildren(
+    taskId: string,
+    workspaceKey: string,
+    linked: string[],
+    seen: Set<string>
+  ): Promise<void> {
+    const ids = new Set(linked)
+    const tasks = await this.store.getTasks()
+    for (const task of tasks) {
+      if (task.workspace_key === workspaceKey && task.parent_task_id === taskId) ids.add(task.task_id)
+    }
+    for (const childId of ids) {
+      await this.cancelTask(childId, workspaceKey, seen)
+    }
   }
 
   async interruptAndInsert(taskId: string, workspaceKey: string, queueItemId: string): Promise<void> {
@@ -552,6 +581,7 @@ export class BuddyRunner {
           updated_at: new Date().toISOString()
         }))
         if (resume === 'QUEUED') this.onTaskTerminal?.(workspaceKey)
+        await this.resumeCascaded(childId, workspaceKey)
         continue
       }
       void this.startTask(childId, { workspace_key: workspaceKey }).catch(() => {})
@@ -1648,6 +1678,9 @@ export class BuddyRunner {
     const childSnapshots = breakConfirmed ? await this.childSnapshots(currentState, workspaceKey) : []
     const breakOutcome = breakConfirmed ? resolveBreakOutcome(currentState, childSnapshots) : null
     const holdChildren = shouldEnterChildWait(currentState, breakConfirmed, breakPending)
+    const pendingChildResults = holdChildren
+      ? Boolean(currentState.derivation_wake_pending) || await this.derivation.childrenNeedParent(taskId, workspaceKey)
+      : false
     const cleaned = breakOutcome !== 'done' || hasQueuedInstructions || await this.cleanupServices(taskId, workspaceKey)
 
     await this.store.appendTranscript(taskId, workspaceKey, normalizeActorRole(actor), transcriptContent, {
@@ -1720,10 +1753,23 @@ export class BuddyRunner {
       }
 
       if (holdChildren) {
+        const wake = pendingChildResults || Boolean(state.derivation_wake_pending)
+        if (wake) {
+          return {
+            ...next,
+            status: roundWindowReached ? 'PAUSED' : 'READY',
+            derivation_hold: null,
+            derivation_wake_pending: null,
+            countdown: null,
+            pending_break: breakRejected ? null : next.pending_break,
+            break_rejected_by: breakRejected ? { actor, round } : null
+          }
+        }
         return {
           ...next,
           status: 'WAITING_CHILDREN',
           derivation_hold: null,
+          derivation_wake_pending: null,
           countdown: null,
           pending_break: breakRejected ? null : next.pending_break,
           break_rejected_by: breakRejected ? { actor, round } : null
@@ -1872,10 +1918,14 @@ export class BuddyRunner {
       })
     }
     if (holdChildren) {
-      await this.store.appendTranscript(taskId, workspaceKey, 'system', '父任务开始等待子任务，不再占用执行名额。', { kind: 'round_notice', round })
-      await this.store.appendTaskEvent(taskId, workspaceKey, { type: 'derivation.waiting', payload: {} })
-      this.onTaskTerminal?.(workspaceKey)
-      return
+      await this.derivation.releaseWaitIfChildrenReady(taskId, workspaceKey)
+      const waitingNow = await this.store.readTaskState(taskId, workspaceKey)
+      if (waitingNow.status === 'WAITING_CHILDREN') {
+        await this.store.appendTranscript(taskId, workspaceKey, 'system', '父任务开始等待子任务，不再占用执行名额。', { kind: 'round_notice', round })
+        await this.store.appendTaskEvent(taskId, workspaceKey, { type: 'derivation.waiting', payload: {} })
+        this.onTaskTerminal?.(workspaceKey)
+        return
+      }
     }
     if (roundWindowReached) {
       await this.store.appendTranscript(

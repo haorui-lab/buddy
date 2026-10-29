@@ -156,7 +156,7 @@ export class QueueCoordinator {
     if (hasIncompleteImmediate || hasActiveQueued) {
       // Record a blocked event (deduped by signature) when a waiting task exists but can't start.
       const blocker = this.findBlocker(states, hasIncompleteImmediate, hasActiveQueued)
-      const earliestWaiting = this.earliestWaiting(queuedEntries)
+      const earliestWaiting = this.earliestWaiting(queuedEntries, states)
       if (earliestWaiting && blocker) {
         await this.recordBlocked(workspaceKey, earliestWaiting, blocker)
       }
@@ -164,7 +164,7 @@ export class QueueCoordinator {
     }
 
     // 3) Pick the earliest waiting queued task.
-    const candidate = this.earliestWaiting(queuedEntries)
+    const candidate = this.earliestWaiting(queuedEntries, states)
     if (!candidate) {
       // Queue successfully idle/advanced — clear any prior blocked signature.
       this.lastSignature.delete(workspaceKey)
@@ -199,14 +199,33 @@ export class QueueCoordinator {
   }
 
   private earliestWaiting(
-    entries: Array<{ task: Task; state: TaskState }>
+    entries: Array<{ task: Task; state: TaskState }>,
+    states: Array<{ task: Task; state: TaskState }>
   ): { task: Task; state: TaskState } | null {
     const waiting = entries.filter(
       (e) => e.state.status === 'QUEUED' && e.state.queue?.state === 'waiting' && !e.state.dependency_blocked
     )
     if (waiting.length === 0) return null
-    waiting.sort((a, b) => compareQueueOrder(a.state, a.task, b.state, b.task))
-    return waiting[0]
+    const preferred = waiting.filter(entry => this.belongsToWaitingTree(entry, states))
+    const pool = preferred.length > 0 ? preferred : waiting
+    pool.sort((a, b) => compareQueueOrder(a.state, a.task, b.state, b.task))
+    return pool[0]
+  }
+
+  /** 父任务已经让出名额时，先跑它自己的子任务，不让后面的根任务插队。 */
+  private belongsToWaitingTree(
+    entry: { task: Task; state: TaskState },
+    states: Array<{ task: Task; state: TaskState }>
+  ): boolean {
+    const byId = new Map(states.map(item => [item.task.task_id, item.state]))
+    let parentId = entry.state.parent_task_id
+    while (parentId) {
+      const parent = byId.get(parentId)
+      if (!parent) return false
+      if (parent.status === 'WAITING_CHILDREN' && parent.pause_cause !== 'user') return true
+      parentId = parent.parent_task_id
+    }
+    return false
   }
 
   /**

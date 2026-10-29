@@ -121,6 +121,7 @@ export interface TaskState {
   pause_cause?: 'user' | 'cascade' | null
   pause_resume_status?: TaskStatus
   derivation_hold?: 'children' | null
+  derivation_wake_pending?: boolean | null
   derivation_proposal?: DerivationProposal | null
   delivery?: TaskDelivery | null
   acceptance?: TaskAcceptance | null

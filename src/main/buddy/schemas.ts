@@ -207,6 +207,7 @@ export const taskStateSchema = z.object({
   pause_cause: z.enum(['user', 'cascade']).nullable().optional(),
   pause_resume_status: taskStatusSchema.optional(),
   derivation_hold: z.enum(['children']).nullable().optional(),
+  derivation_wake_pending: z.boolean().nullable().optional(),
   derivation_proposal: derivationProposalSchema.nullable().optional(),
   delivery: taskDeliverySchema.nullable().optional(),
   acceptance: taskAcceptanceSchema.nullable().optional(),

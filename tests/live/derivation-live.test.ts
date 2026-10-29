@@ -167,7 +167,7 @@ describe('live derivation with real actors', () => {
     for (const task of await store.getTasks()) {
       snapshots.push(await store.readTaskState(task.task_id, ws))
     }
-    const tree = taskChildren(await store.getTasks(), created.task).map(task => ({
+    const tree = taskChildren(await store.getTasks(), created.task, ws).map(task => ({
       task_id: task.task_id,
       title: task.title,
       status: task.status,

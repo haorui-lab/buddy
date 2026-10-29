@@ -145,8 +145,12 @@ export class QueueCoordinator {
     //    Superseded tasks (queue.state === 'superseded') never block, even if not DONE.
     const hasActiveQueued = queuedEntries.some((entry) =>
       entry.state.queue?.state !== 'superseded' &&
+      !entry.state.dependency_blocked &&
       entry.state.status !== 'QUEUED' &&
-      entry.state.status !== 'DONE' && entry.state.status !== 'CANCELLED'
+      entry.state.status !== 'DONE' &&
+      entry.state.status !== 'CANCELLED' &&
+      entry.state.status !== 'WAITING_CHILDREN' &&
+      entry.state.status !== 'AWAITING_ACCEPTANCE'
     )
 
     if (hasIncompleteImmediate || hasActiveQueued) {
@@ -198,7 +202,7 @@ export class QueueCoordinator {
     entries: Array<{ task: Task; state: TaskState }>
   ): { task: Task; state: TaskState } | null {
     const waiting = entries.filter(
-      (e) => e.state.status === 'QUEUED' && e.state.queue?.state === 'waiting'
+      (e) => e.state.status === 'QUEUED' && e.state.queue?.state === 'waiting' && !e.state.dependency_blocked
     )
     if (waiting.length === 0) return null
     waiting.sort((a, b) => compareQueueOrder(a.state, a.task, b.state, b.task))
@@ -386,6 +390,8 @@ function effectiveMode(state: TaskState): 'immediate' | 'queued' {
  * Explicit queued tasks are handled by the hasActiveQueued branch, not this helper.
  */
 function blocksQueue(state: TaskState): boolean {
+  if (state.dependency_blocked) return false
+  if (state.status === 'WAITING_CHILDREN' || state.status === 'AWAITING_ACCEPTANCE') return false
   if (state.execution_mode === undefined) {
     return isActivelyRunning(state.status)
   }

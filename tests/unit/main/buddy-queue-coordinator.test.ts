@@ -519,4 +519,43 @@ describe('QueueCoordinator', () => {
     const legacy = tasks.find((t) => t.task_id === 'legacy')!
     expect(legacy.execution_mode ?? 'immediate').toBe('immediate')
   })
+
+  it('lets a queued child start while its parent is waiting, and keeps a single slot moving', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'buddy-qc-derive-'))
+    const { store, coordinator, startCalls } = makeCoordinator(root)
+    const parent = await store.createTask({ task_id: 'parent', repo_root: '/tmp/repo', execution_mode: 'queued' })
+    const ws = parent.workspace_key
+    await store.updateTaskState('parent', ws, state => ({
+      ...state,
+      status: 'RUNNING_CLAUDE',
+      queue: { state: 'active', enqueued_at: state.queue?.enqueued_at ?? state.created_at ?? '' }
+    }))
+    await store.createTask({
+      task_id: 'child-a',
+      repo_root: '/tmp/repo',
+      workspace_key: ws,
+      execution_mode: 'queued',
+      parent_task_id: 'parent'
+    })
+    await store.createTask({
+      task_id: 'child-b',
+      repo_root: '/tmp/repo',
+      workspace_key: ws,
+      execution_mode: 'queued',
+      parent_task_id: 'parent',
+      dependency_blocked: true,
+      depends_on_task_ids: ['child-a']
+    })
+    await coordinator.reconcile(ws)
+    expect(startCalls.map(call => call.taskId)).toEqual([])
+
+    await store.updateTaskState('parent', ws, state => ({ ...state, status: 'WAITING_CHILDREN', active_run: null }))
+    await coordinator.reconcile(ws)
+    expect(startCalls.map(call => call.taskId)).toEqual(['child-a'])
+
+    await store.updateTaskState('child-a', ws, state => ({ ...state, status: 'AWAITING_ACCEPTANCE', active_run: null }))
+    await store.updateTaskState('child-b', ws, state => ({ ...state, dependency_blocked: false }))
+    await coordinator.reconcile(ws)
+    expect(startCalls.map(call => call.taskId)).toEqual(['child-a', 'child-b'])
+  })
 })

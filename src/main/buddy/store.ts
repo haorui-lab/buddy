@@ -78,7 +78,11 @@ export class BuddyStore {
             active_run: state.active_run ?? null,
             execution_mode: state.execution_mode ?? 'immediate',
             queue: state.queue,
-            created_at: state.created_at
+            created_at: state.created_at,
+            parent_task_id: state.parent_task_id ?? null,
+            root_task_id: state.root_task_id ?? null,
+            derivation_depth: state.derivation_depth ?? 0,
+            title: state.title
           })
         } catch {
           // Ignore unreadable task directories; schema errors surface on detail load.
@@ -120,7 +124,11 @@ export class BuddyStore {
     }
     const requestedTaskId = validation.value
     const repoRoot = canonicalRepoRoot(input.repo_root ?? '')
-    const workspaceKey = workspaceKeyForRepo(repoRoot || requestedTaskId)
+    const requestedWorkspace = input.workspace_key?.trim()
+    if (requestedWorkspace && (requestedWorkspace.includes('/') || requestedWorkspace.includes('\\') || requestedWorkspace === '.' || requestedWorkspace === '..')) {
+      throw new Error('Invalid workspace key')
+    }
+    const workspaceKey = requestedWorkspace || workspaceKeyForRepo(repoRoot || requestedTaskId)
     const taskId = await deduplicateTaskId(requestedTaskId, this.taskDirectory.bind(this), workspaceKey)
     const dir = this.taskDirectory(taskId, workspaceKey)
     const now = utcNow()
@@ -140,6 +148,20 @@ export class BuddyStore {
       }
     } else {
       state.execution_mode = 'immediate'
+    }
+    if (input.parent_task_id) {
+      state.parent_task_id = input.parent_task_id
+      state.root_task_id = input.root_task_id || input.parent_task_id
+      state.derivation_depth = input.derivation_depth ?? 1
+      state.title = input.title
+      state.work_dir = input.work_dir
+      state.spec_key = input.spec_key
+      state.depends_on_task_ids = input.depends_on_task_ids ?? []
+      state.child_task_ids = []
+      if (input.dependency_blocked) {
+        state.dependency_blocked = true
+        state.status = 'QUEUED'
+      }
     }
     state.event_seq = 1
 

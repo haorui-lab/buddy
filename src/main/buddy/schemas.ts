@@ -44,10 +44,65 @@ const taskStatusSchema = z.enum([
   'PAUSED',
   'FAILED',
   'DONE',
-  'CANCELLED'
+  'CANCELLED',
+  'WAITING_CHILDREN',
+  'AWAITING_ACCEPTANCE'
 ])
 
 const executionModeSchema = z.enum(['immediate', 'queued'])
+
+const derivationSpecSchema = z.object({
+  key: z.string(),
+  title: z.string(),
+  goal: z.string().default(''),
+  scope: z.string().default(''),
+  context: z.string().default(''),
+  dependencies: z.array(z.string()).default([]),
+  deliverables: z.string().default(''),
+  acceptance: z.string().default('')
+})
+
+const derivationDecisionSchema = z.object({
+  actor: z.string(),
+  decision: z.enum(['agree', 'disagree']),
+  reason: z.string().default(''),
+  proposal_hash: z.string(),
+  at: z.string()
+})
+
+const derivationProposalSchema = z.object({
+  proposal_id: z.string(),
+  proposal_hash: z.string(),
+  specs: z.array(derivationSpecSchema),
+  proposed_by: z.string(),
+  proposed_at: z.string(),
+  decisions: z.array(derivationDecisionSchema).default([]),
+  created_task_ids: z.array(z.string()).default([]),
+  status: z.enum(['open', 'created', 'rejected'])
+})
+
+const taskDeliverySchema = z.object({
+  version: z.string(),
+  artifacts: z.string().default(''),
+  verification: z.string().default(''),
+  open_issues: z.string().default(''),
+  submitted_at: z.string(),
+  submitted_by: z.string()
+})
+
+const taskAcceptanceSchema = z.object({
+  decision: z.enum(['accept', 'reject']),
+  comment: z.string().default(''),
+  at: z.string(),
+  actor: z.string(),
+  version: z.string().optional()
+})
+
+const taskWaiverSchema = z.object({
+  actor: z.string(),
+  reason: z.string(),
+  at: z.string()
+})
 
 const taskQueueInfoSchema = z.object({
   state: z.enum(['waiting', 'active', 'superseded']),
@@ -139,7 +194,23 @@ export const taskStateSchema = z.object({
   compact_retries: z.number().optional(),
   execution_mode: executionModeSchema.optional(),
   queue: taskQueueInfoSchema.optional(),
-  service_cleanup_pending: z.boolean().optional()
+  service_cleanup_pending: z.boolean().optional(),
+  parent_task_id: z.string().nullable().optional(),
+  root_task_id: z.string().nullable().optional(),
+  derivation_depth: z.number().int().nonnegative().optional(),
+  child_task_ids: z.array(z.string()).optional(),
+  title: z.string().optional(),
+  work_dir: z.string().optional(),
+  spec_key: z.string().optional(),
+  depends_on_task_ids: z.array(z.string()).optional(),
+  dependency_blocked: z.boolean().optional(),
+  pause_cause: z.enum(['user', 'cascade']).nullable().optional(),
+  pause_resume_status: taskStatusSchema.optional(),
+  derivation_hold: z.enum(['children']).nullable().optional(),
+  derivation_proposal: derivationProposalSchema.nullable().optional(),
+  delivery: taskDeliverySchema.nullable().optional(),
+  acceptance: taskAcceptanceSchema.nullable().optional(),
+  waiver: taskWaiverSchema.nullable().optional()
 })
 
 export const launcherSchema = z.object({
@@ -198,7 +269,9 @@ export const globalSettingsSchema = z.object({
   auto_generate_commit_message: z.boolean().default(true),
   system_notifications_enabled: z.boolean().default(true),
   max_upgrade_retries: z.number().optional(),
-  custom_prompt: optionalNonEmptyString
+  custom_prompt: optionalNonEmptyString,
+  allow_nested_derivation: z.boolean().default(false),
+  derivation_prompt: optionalNonEmptyString
 })
 
 export const eventSchema = z.object({

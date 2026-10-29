@@ -710,6 +710,8 @@ export default function App() {
                 onRetryHealthCheck={handleRetryHealthCheck}
                 isRetryingHealthCheck={isRetryingHealthCheck}
                 onViewChanges={hasChangedFiles ? () => setShowTaskDoneChanges(true) : undefined}
+                tasks={tasks}
+                onSelectTask={handleSelectTask}
                 draft={currentDraft}
                 onDraftChange={handleDraftChange}
                 attachments={currentAttachments}

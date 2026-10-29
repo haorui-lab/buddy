@@ -36,7 +36,19 @@ export function writeTaskNames(names: TaskNames) {
 
 export function displayNameForTask(task: Task, taskNames?: TaskNames): string {
   if (taskNames?.[task.task_id]) return taskNames[task.task_id]
+  if (task.title) return task.title
   return task.task_id
+}
+
+export function taskChildren(tasks: Task[], parentId: string): Task[] {
+  return tasks
+    .filter(task => task.parent_task_id === parentId)
+    .sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''))
+}
+
+export function isTaskRoot(task: Task, tasks: Task[]): boolean {
+  if (!task.parent_task_id) return true
+  return !tasks.some(item => item.task_id === task.parent_task_id && item.workspace_key === task.workspace_key)
 }
 
 // --- Unread state ---

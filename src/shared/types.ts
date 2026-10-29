@@ -10,6 +10,10 @@ export interface Task {
   execution_mode?: ExecutionMode
   queue?: TaskQueueInfo
   created_at?: string
+  parent_task_id?: string | null
+  root_task_id?: string | null
+  derivation_depth?: number
+  title?: string
 }
 
 export type TaskStatus =
@@ -30,6 +34,8 @@ export type TaskStatus =
   | 'FAILED'
   | 'DONE'
   | 'CANCELLED'
+  | 'WAITING_CHILDREN'
+  | 'AWAITING_ACCEPTANCE'
 
 /** Per-project FIFO queue metadata attached to queued-execution tasks. */
 export interface TaskQueueInfo {
@@ -103,6 +109,76 @@ export interface TaskState {
   execution_mode?: ExecutionMode
   queue?: TaskQueueInfo
   service_cleanup_pending?: boolean
+  parent_task_id?: string | null
+  root_task_id?: string | null
+  derivation_depth?: number
+  child_task_ids?: string[]
+  title?: string
+  work_dir?: string
+  spec_key?: string
+  depends_on_task_ids?: string[]
+  dependency_blocked?: boolean
+  pause_cause?: 'user' | 'cascade' | null
+  pause_resume_status?: TaskStatus
+  derivation_hold?: 'children' | null
+  derivation_proposal?: DerivationProposal | null
+  delivery?: TaskDelivery | null
+  acceptance?: TaskAcceptance | null
+  waiver?: TaskWaiver | null
+}
+
+export interface DerivationSpec {
+  key: string
+  title: string
+  goal: string
+  scope: string
+  context: string
+  dependencies: string[]
+  deliverables: string
+  acceptance: string
+}
+
+export interface DerivationDecision {
+  actor: string
+  decision: 'agree' | 'disagree'
+  reason: string
+  proposal_hash: string
+  at: string
+}
+
+export interface DerivationProposal {
+  proposal_id: string
+  proposal_hash: string
+  specs: DerivationSpec[]
+  proposed_by: string
+  proposed_at: string
+  decisions: DerivationDecision[]
+  created_task_ids: string[]
+  status: 'open' | 'created' | 'rejected'
+}
+
+export interface TaskDelivery {
+  version: string
+  artifacts: string
+  verification: string
+  open_issues: string
+  submitted_at: string
+  submitted_by: string
+}
+
+export interface TaskAcceptance {
+  decision: 'accept' | 'reject'
+  comment: string
+  at: string
+  actor: string
+  version?: string
+}
+
+/** 父任务明确放弃一个已取消子任务后，该子任务不再挡住父任务结束。 */
+export interface TaskWaiver {
+  actor: string
+  reason: string
+  at: string
 }
 
 export interface Countdown {
@@ -237,6 +313,10 @@ export interface GlobalSettings {
   system_notifications_enabled?: boolean
   max_upgrade_retries?: number
   custom_prompt?: string
+  /** 关闭时只允许根任务派生子任务；开启后子任务可以继续向下派生。 */
+  allow_nested_derivation?: boolean
+  /** 未设置时使用内置默认派生提示词。 */
+  derivation_prompt?: string
 }
 
 export interface BuddyError {
@@ -285,6 +365,15 @@ export interface CreateTaskInput {
   context_text?: string
   settings?: Record<string, unknown>
   execution_mode?: ExecutionMode
+  workspace_key?: string
+  parent_task_id?: string
+  root_task_id?: string
+  derivation_depth?: number
+  title?: string
+  work_dir?: string
+  spec_key?: string
+  depends_on_task_ids?: string[]
+  dependency_blocked?: boolean
 }
 
 export interface CreateTaskResult {

@@ -55,6 +55,8 @@ function compactStatusInfo(status: TaskStatus | null | undefined): CompactStatus
   if (status === 'FAILED') return { cls: 'danger', labelKey: 'status.FAILED', pulse: false }
   if (status === 'READY') return { cls: 'ready', labelKey: 'status.READY', pulse: false }
   if (status === 'QUEUED') return { cls: 'ready', labelKey: 'status.QUEUED', pulse: false }
+  if (status === 'WAITING_CHILDREN') return { cls: 'paused', labelKey: 'status.WAITING_CHILDREN', pulse: false }
+  if (status === 'AWAITING_ACCEPTANCE') return { cls: 'ready', labelKey: 'status.AWAITING_ACCEPTANCE', pulse: false }
   return null
 }
 

@@ -10,6 +10,8 @@ export function statusClass(status: TaskStatus): string {
   if (status === 'PAUSED') return 'paused'
   if (status === 'CANCELLED') return 'paused'
   if (status === 'DONE') return 'done'
+  if (status === 'WAITING_CHILDREN') return 'paused'
+  if (status === 'AWAITING_ACCEPTANCE') return 'ready'
   return 'neutral'
 }
 

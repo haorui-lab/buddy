@@ -52,6 +52,7 @@ export interface BuildActorPromptInput {
   userMessage?: string
   cursorSingleTurn?: boolean
   managedServices?: boolean
+  derivationSection?: string
 }
 
 export const CURSOR_SINGLE_TURN_INSTRUCTIONS = `## Cursor turn lifecycle
@@ -196,6 +197,10 @@ export function buildActorPrompt(input: BuildActorPromptInput): string {
     parts.push('', '## Custom instructions', customPrompt)
   }
 
+  if (input.derivationSection?.trim()) {
+    parts.push('', '## Task derivation', input.derivationSection.trim())
+  }
+
   return `${parts.join('\n').trimEnd()}\n`
 }
 
@@ -219,6 +224,8 @@ export function runtimeSettingsLines(
     `- Next actor after this turn: ${nextActor(actor, settings)} (${isImplementer ? 'Reviewer' : 'Implementer'})`
   ]
   if (repoRoot) lines.push(`- Repository: ${repoRoot}`)
+  if (state.work_dir) lines.push(`- Work directory: ${state.work_dir}`)
+  if (state.parent_task_id) lines.push(`- Parent task: ${state.parent_task_id}`)
   if (state.countdown?.deadline) lines.push(`- Active countdown deadline: ${state.countdown.deadline}`)
   const consecutiveFailures = numberValue(state.consecutive_failures, 0)
   if (consecutiveFailures > 0) {

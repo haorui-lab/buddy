@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ListOrdered, CornerDownRight, Trash2, Sparkles, Plus, FileCode2, FileText, File, FileJson, FileArchive, FileSpreadsheet, Image as ImageIcon } from 'lucide-react'
-import { TaskDetail, InstructionQueueItem, Attachment, AttachmentMeta } from '../../shared/types'
+import { Task, TaskDetail, InstructionQueueItem, Attachment, AttachmentMeta } from '../../shared/types'
 import { MessageBubble } from './MessageBubble'
 import { RunningStatusMessage, RunningDetailPanel } from './RunningStatusMessage'
 import { Composer } from './Composer'
@@ -96,13 +96,15 @@ interface ChatAreaProps {
   onRetryHealthCheck: () => void
   isRetryingHealthCheck: boolean
   onViewChanges?: () => void
+  tasks?: Task[]
+  onSelectTask?: (taskId: string, workspaceKey: string) => void
   draft: string
   onDraftChange: (value: string) => void
   attachments: Attachment[]
   onAttachmentsChange: (attachments: Attachment[]) => void
 }
 
-export function ChatArea({ task, hasAnyTasks, onSendMessage, onStartTask, onInterrupt, onEnqueueInstruction, onInterruptAndInsert, onDequeueInstruction, onEditInstruction, onClearInstructionQueue, onCreateTask, onRetryHealthCheck, isRetryingHealthCheck, onViewChanges, draft, onDraftChange, attachments, onAttachmentsChange }: ChatAreaProps) {
+export function ChatArea({ task, hasAnyTasks, onSendMessage, onStartTask, onInterrupt, onEnqueueInstruction, onInterruptAndInsert, onDequeueInstruction, onEditInstruction, onClearInstructionQueue, onCreateTask, onRetryHealthCheck, isRetryingHealthCheck, onViewChanges, tasks = [], onSelectTask, draft, onDraftChange, attachments, onAttachmentsChange }: ChatAreaProps) {
   const t = useT()
   const transcriptRef = useRef<HTMLDivElement>(null)
   const [showScrollBtn, setShowScrollBtn] = useState(false)
@@ -219,6 +221,48 @@ export function ChatArea({ task, hasAnyTasks, onSendMessage, onStartTask, onInte
           )
         ) : (
           <>
+            {task.state.parent_task_id && (
+              <button
+                type="button"
+                onClick={() => onSelectTask?.(task.state.parent_task_id!, task.workspace_key)}
+                className="mb-3 text-xs text-fg-secondary hover:text-fg"
+              >
+                {t('derivation.backToParent')}
+              </button>
+            )}
+            {(task.state.work_dir || task.state.delivery || task.state.acceptance || tasks.some(item => item.parent_task_id === task.task_id)) && (
+              <div className="mb-3 rounded-lg border border-border px-3 py-2 text-xs text-fg-secondary space-y-1">
+                {task.state.work_dir && <div>{t('derivation.workDir')}：{task.state.work_dir}</div>}
+                {task.state.delivery && (
+                  <div>
+                    {t('derivation.delivery')}：{task.state.delivery.version}
+                    {task.state.delivery.verification ? ` · ${task.state.delivery.verification}` : ''}
+                    {task.state.delivery.open_issues ? ` · ${task.state.delivery.open_issues}` : ''}
+                  </div>
+                )}
+                {task.state.acceptance && (
+                  <div>
+                    {t('derivation.acceptance')}：{task.state.acceptance.decision === 'accept' ? t('status.DONE') : task.state.acceptance.comment}
+                    {task.state.acceptance.decision === 'accept' && task.state.acceptance.comment ? ` · ${task.state.acceptance.comment}` : ''}
+                  </div>
+                )}
+                {tasks.some(item => item.parent_task_id === task.task_id) && (
+                  <div className="space-y-1">
+                    <div>{t('derivation.children')}</div>
+                    {tasks.filter(item => item.parent_task_id === task.task_id && item.workspace_key === task.workspace_key).map(child => (
+                      <button
+                        key={child.task_id}
+                        type="button"
+                        onClick={() => onSelectTask?.(child.task_id, child.workspace_key)}
+                        className="block text-left hover:text-fg"
+                      >
+                        {child.title || child.task_id} · {t(`status.${child.status}` as 'status.READY')}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
             {showTaskBrief && (
               <div className="flex mb-3 justify-start">
                 <div className="message task-brief-card w-full">

@@ -21,6 +21,7 @@ import { extractActorOutput, parseActorEvents, parseActorLine, parseBuddyMessage
 import { buildActorPrompt, buildPingPrompt, hashText, nextActor as nextActorForSettings, implementerActor as resolveImplementerActor, actorDisplayName } from './prompts'
 import { BuddyStore } from './store'
 import { TaskServiceManager, type ServiceRun } from './task-services'
+import { blocksParentCompletion, DerivationService, resolveBreakOutcome, shouldEnterChildWait, type ChildSnapshot, type DerivationSession } from './derivation'
 import { BuddyEventBus } from './events'
 import type { TaskNotifier } from './notifications'
 import { AcpClient, AcpStdioTransport, applyAcpSessionModel, defaultAcpArgs, prepareAcpEnvironment, resolveAcpBinary } from './acp'
@@ -165,6 +166,7 @@ export function isMissingResultError(error: unknown): boolean {
 
 export class BuddyRunner {
   readonly services: TaskServiceManager
+  readonly derivation: DerivationService
   private readonly pendingTasks = new Map<string, Set<Promise<unknown>>>()
   private readonly cancelling = new Set<string>()
   private readonly healthControllers = new Map<string, AbortController>()
@@ -184,6 +186,12 @@ export class BuddyRunner {
     options: RunnerOptions = {}
   ) {
     this.services = new TaskServiceManager(store)
+    this.derivation = new DerivationService(store, {
+      startTask: (taskId, workspaceKey) => this.startTask(taskId, { workspace_key: workspaceKey }),
+      terminal: (workspaceKey) => this.onTaskTerminal?.(workspaceKey),
+      cleanup: (taskId, workspaceKey) => this.cleanupServices(taskId, workspaceKey),
+      events: options.events
+    })
     this.executeLaunchers = options.executeLaunchers ?? true
     this.events = options.events
     this.notifier = options.notifier
@@ -322,6 +330,8 @@ export class BuddyRunner {
         countdown: null,
         latest_failure: null,
         last_error: null,
+        pause_cause: null,
+        pause_resume_status: undefined,
         updated_at: startedAt
       }
     })
@@ -331,6 +341,10 @@ export class BuddyRunner {
       run_id: runId,
       payload: { run_id: runId, mode: sessionIdBefore ? 'resume' : 'start' }
     })
+
+    if (detail.state.status === 'PAUSED') {
+      void this.resumeCascaded(taskId, workspaceKey)
+    }
 
     if (!this.executeLaunchers) {
       return { run_id: runId }
@@ -418,7 +432,8 @@ export class BuddyRunner {
   async interrupt(taskId: string, workspaceKey: string): Promise<void> {
     const state = await this.store.readTaskState(taskId, workspaceKey)
     if (state.status === 'DONE' || state.status === 'CANCELLED') return
-    await this.pauseAndAbortRun(taskId, workspaceKey, {})
+    await this.pauseAndAbortRun(taskId, workspaceKey, {}, 'user')
+    await this.pauseDescendants(taskId, workspaceKey, new Set([taskId]))
   }
 
   async cleanupServices(taskId: string, workspaceKey: string): Promise<boolean> {
@@ -434,7 +449,14 @@ export class BuddyRunner {
     return true
   }
 
-  async cancelTask(taskId: string, workspaceKey: string): Promise<void> {
+  async cancelTask(taskId: string, workspaceKey: string, seen = new Set<string>()): Promise<void> {
+    if (seen.has(taskId)) return
+    seen.add(taskId)
+    const existing = await this.store.readTaskState(taskId, workspaceKey).catch(() => null)
+    if (!existing || existing.status === 'CANCELLED' || existing.status === 'DONE') return
+    for (const childId of existing.child_task_ids ?? []) {
+      await this.cancelTask(childId, workspaceKey, seen)
+    }
     const key = this.runControllerKey(workspaceKey, taskId)
     if (this.cancelling.has(key)) throw new Error('Task cancellation is already in progress')
     this.cancelling.add(key)
@@ -479,14 +501,20 @@ export class BuddyRunner {
   private async pauseAndAbortRun(
     taskId: string,
     workspaceKey: string,
-    payload: Record<string, unknown>
+    payload: Record<string, unknown>,
+    cause?: 'user' | 'cascade'
   ): Promise<void> {
     const state = await this.store.readTaskState(taskId, workspaceKey)
+    if (state.status === 'DONE' || state.status === 'CANCELLED' || state.status === 'AWAITING_ACCEPTANCE') return
+    if (cause === 'cascade' && state.status === 'PAUSED' && state.pause_cause !== 'cascade') return
     const runId = state.active_run?.run_id ?? null
+    const resumeStatus = state.status
     await this.store.updateTaskState(taskId, workspaceKey, (current) => ({
       ...current,
       status: 'PAUSED',
       active_run: null,
+      pause_cause: cause ?? current.pause_cause ?? null,
+      pause_resume_status: cause ? resumeStatus : current.pause_resume_status,
       updated_at: new Date().toISOString()
     }))
     await this.store.appendTaskEvent(taskId, workspaceKey, {
@@ -497,6 +525,37 @@ export class BuddyRunner {
       this.abortRunController(workspaceKey, taskId, runId)
     }
     this.healthControllers.get(this.runControllerKey(workspaceKey, taskId))?.abort()
+  }
+
+  private async pauseDescendants(taskId: string, workspaceKey: string, seen: Set<string>): Promise<void> {
+    const state = await this.store.readTaskState(taskId, workspaceKey).catch(() => null)
+    for (const childId of state?.child_task_ids ?? []) {
+      if (seen.has(childId)) continue
+      seen.add(childId)
+      await this.pauseAndAbortRun(childId, workspaceKey, { reason: 'parent_paused' }, 'cascade')
+      await this.pauseDescendants(childId, workspaceKey, seen)
+    }
+  }
+
+  private async resumeCascaded(taskId: string, workspaceKey: string): Promise<void> {
+    const state = await this.store.readTaskState(taskId, workspaceKey).catch(() => null)
+    for (const childId of state?.child_task_ids ?? []) {
+      const child = await this.store.readTaskState(childId, workspaceKey).catch(() => null)
+      if (!child || child.pause_cause !== 'cascade' || child.status !== 'PAUSED') continue
+      const resume = child.pause_resume_status
+      if (resume === 'WAITING_CHILDREN' || resume === 'QUEUED' || resume === 'AWAITING_ACCEPTANCE') {
+        await this.store.updateTaskState(childId, workspaceKey, current => ({
+          ...current,
+          status: resume,
+          pause_cause: null,
+          pause_resume_status: undefined,
+          updated_at: new Date().toISOString()
+        }))
+        if (resume === 'QUEUED') this.onTaskTerminal?.(workspaceKey)
+        continue
+      }
+      void this.startTask(childId, { workspace_key: workspaceKey }).catch(() => {})
+    }
   }
 
   async enqueueInstruction(taskId: string, workspaceKey: string, content: string, attachments?: AttachmentMeta[]): Promise<InstructionQueueItem> {
@@ -699,7 +758,7 @@ export class BuddyRunner {
     const launcher = this.resolveEffectiveLauncher(actor, detail.settings.launchers, globalSettings.launchers)
 
     if (launcher.protocol === 'acp') {
-      const cwd = await existingCwd(detail.state.repo_root)
+      const cwd = await actorCwd(detail.state)
       const baseArgs = launcher.args && launcher.args.length > 0 ? launcher.args : defaultAcpArgs(launcher.command, actor)
       const resolved = resolveAcpBinary(launcher.command, baseArgs)
       const acpEnv = await prepareAcpEnvironment(actor, launcher.env, this.store.dataRoot)
@@ -732,7 +791,7 @@ export class BuddyRunner {
     const eventFile = join(artifactsDir, `${runId}-events.jsonl`)
     await writeFile(promptFile, prompt)
 
-    const cwd = await existingCwd(detail.state.repo_root)
+    const cwd = await actorCwd(detail.state)
     const commandKind = commandKindFor(actor, launcher.command)
     const command = buildLauncherCommand({
       actor,
@@ -1027,24 +1086,8 @@ export class BuddyRunner {
     const detail = await this.store.getTaskDetail(taskId, workspaceKey)
     const globalSettings = await this.store.readGlobalSettings()
     const launcher = this.resolveEffectiveLauncher(actor, detail.settings.launchers, globalSettings.launchers)
-    const cwd = await existingCwd(detail.state.repo_root)
+    const cwd = await actorCwd(detail.state)
     const existingSessionId = sessionIdForActor(actor, detail.state, detail.settings)
-    const args = launcher.args && launcher.args.length > 0 ? launcher.args : defaultAcpArgs(launcher.command, actor)
-
-    const prompt = buildActorPrompt({
-      actor,
-      round: detail.state.round,
-      repoRoot: detail.state.repo_root ?? '',
-      taskText: detail.task_text,
-      contextText: detail.context_text,
-      transcript: detail.transcript,
-      settings: detail.settings,
-      state: detail.state,
-      globalSettings,
-      userMessage,
-      cursorSingleTurn: false,
-      managedServices: true
-    })
 
     const lockPath = await createRunLock(this.store.dataRoot, {
       workspace_key: workspaceKey,
@@ -1054,17 +1097,34 @@ export class BuddyRunner {
     })
 
     let serviceRun: ServiceRun | undefined
+    let derivationRun: DerivationSession | undefined
     let client: AcpClient | undefined
     let transport: AcpStdioTransport | undefined
 
     try {
       if (signal.aborted) return
       serviceRun = await this.services.openRun(taskId, workspaceKey, runId, launcher.env)
+      derivationRun = await this.derivation.openRun(taskId, workspaceKey, actor, runId)
+      const prompt = buildActorPrompt({
+        actor,
+        round: detail.state.round,
+        repoRoot: detail.state.repo_root ?? '',
+        taskText: detail.task_text,
+        contextText: detail.context_text,
+        transcript: detail.transcript,
+        settings: detail.settings,
+        state: detail.state,
+        globalSettings,
+        userMessage,
+        cursorSingleTurn: false,
+        managedServices: true,
+        derivationSection: await this.derivation.promptSection(taskId, workspaceKey, globalSettings, derivationRun.env)
+      })
       const startedAtMs = Date.now()
 
       const acpEnv = await prepareAcpEnvironment(
         actor,
-        { ...launcher.env, ...serviceRun.env },
+        { ...launcher.env, ...serviceRun.env, ...(derivationRun?.env ?? {}) },
         this.store.dataRoot,
         existingSessionId || undefined
       )
@@ -1246,6 +1306,7 @@ export class BuddyRunner {
       throw error
     } finally {
       await client?.close().catch(() => {})
+      derivationRun?.close()
       serviceRun?.close()
       await removeRunLock(lockPath)
     }
@@ -1271,44 +1332,15 @@ export class BuddyRunner {
     const taskDirectory = this.store.taskDirectory(taskId, workspaceKey)
     const artifactsDir = join(taskDirectory, 'artifacts')
     await mkdir(artifactsDir, { recursive: true })
-    const prompt = buildActorPrompt({
-      actor,
-      round: detail.state.round,
-      repoRoot: detail.state.repo_root ?? '',
-      taskText: detail.task_text,
-      contextText: detail.context_text,
-      transcript: detail.transcript,
-      settings: detail.settings,
-      state: detail.state,
-      globalSettings,
-      userMessage,
-      cursorSingleTurn: commandKindFor(actor, launcher.command) === 'native_cursor',
-      managedServices: true
-    })
     const promptFile = join(artifactsDir, `${runId}-prompt.md`)
     const outputFile = join(artifactsDir, `${runId}-output.md`)
     const eventFile = join(artifactsDir, `${runId}-events.jsonl`)
-    await writeFile(promptFile, prompt)
-    const cwd = await existingCwd(detail.state.repo_root)
+    const cwd = await actorCwd(detail.state)
     const existingSessionId = sessionIdForActor(actor, detail.state, detail.settings)
     const commandKind = commandKindFor(actor, launcher.command)
     const sessionId = actor === 'kimi' && commandKind === 'native_kimi'
       ? existingSessionId
       : (existingSessionId ?? undefined)
-    const command = buildLauncherCommand({
-      actor,
-      command: launcher.command,
-      mode: existingSessionId ? 'resume' : 'start',
-      promptFile,
-      promptText: prompt,
-      eventFile,
-      outputFile,
-      repoRoot: cwd,
-      taskDir: taskDirectory,
-      runId,
-      sessionId,
-      timeoutSeconds: launcher.timeout_seconds
-    })
     const outputLines: string[] = []
     const stderrLines: string[] = []
     const lockPath = await createRunLock(this.store.dataRoot, {
@@ -1319,15 +1351,48 @@ export class BuddyRunner {
     })
 
     let serviceRun: ServiceRun | undefined
+    let derivationRun: DerivationSession | undefined
     try {
       if (signal.aborted) return
       serviceRun = await this.services.openRun(taskId, workspaceKey, runId, launcher.env)
+      derivationRun = await this.derivation.openRun(taskId, workspaceKey, actor, runId)
+      const prompt = buildActorPrompt({
+        actor,
+        round: detail.state.round,
+        repoRoot: detail.state.repo_root ?? '',
+        taskText: detail.task_text,
+        contextText: detail.context_text,
+        transcript: detail.transcript,
+        settings: detail.settings,
+        state: detail.state,
+        globalSettings,
+        userMessage,
+        cursorSingleTurn: commandKind === 'native_cursor',
+        managedServices: true,
+        derivationSection: await this.derivation.promptSection(taskId, workspaceKey, globalSettings, derivationRun.env)
+      })
+      await writeFile(promptFile, prompt)
+      const command = buildLauncherCommand({
+        actor,
+        command: launcher.command,
+        mode: existingSessionId ? 'resume' : 'start',
+        promptFile,
+        promptText: prompt,
+        eventFile,
+        outputFile,
+        repoRoot: cwd,
+        taskDir: taskDirectory,
+        runId,
+        sessionId,
+        timeoutSeconds: launcher.timeout_seconds
+      })
       const startedAtMs = Date.now()
       const result = await this.runActorCommand(
-        command, cwd, { ...launcher.env, ...serviceRun.env }, launcher.timeout_seconds * 1000,
+        command, cwd, { ...launcher.env, ...serviceRun.env, ...(derivationRun?.env ?? {}) }, launcher.timeout_seconds * 1000,
         actor, workspaceKey, taskId, runId,
         outputLines, stderrLines, signal
       )
+      derivationRun?.close()
       serviceRun.close()
       const elapsedMs = Date.now() - startedAtMs
 
@@ -1524,6 +1589,7 @@ export class BuddyRunner {
       await this.markFailed(taskId, workspaceKey, actor, failureMessage, runId)
       throw error
     } finally {
+      derivationRun?.close()
       serviceRun?.close()
       await removeRunLock(lockPath)
     }
@@ -1579,7 +1645,10 @@ export class BuddyRunner {
     const breakPending = message.kind === 'break' && !breakConfirmed
     const breakRejected = message.kind !== 'break' && Boolean(pendingBreak?.actor)
     const hasQueuedInstructions = (currentState.instruction_queue?.length ?? 0) > 0
-    const cleaned = !breakConfirmed || hasQueuedInstructions || await this.cleanupServices(taskId, workspaceKey)
+    const childSnapshots = breakConfirmed ? await this.childSnapshots(currentState, workspaceKey) : []
+    const breakOutcome = breakConfirmed ? resolveBreakOutcome(currentState, childSnapshots) : null
+    const holdChildren = shouldEnterChildWait(currentState, breakConfirmed, breakPending)
+    const cleaned = breakOutcome !== 'done' || hasQueuedInstructions || await this.cleanupServices(taskId, workspaceKey)
 
     await this.store.appendTranscript(taskId, workspaceKey, normalizeActorRole(actor), transcriptContent, {
       round,
@@ -1625,12 +1694,18 @@ export class BuddyRunner {
       if (actor === 'wecode_opencode' && sessionId) next.wecode_opencode_session_id = sessionId
 
       if (breakConfirmed) {
+        const status: TaskState['status'] = breakOutcome === 'blocked' || breakOutcome === 'needs_delivery'
+          ? (roundWindowReached ? 'PAUSED' : 'READY')
+          : breakOutcome === 'await_parent'
+            ? 'AWAITING_ACCEPTANCE'
+            : (hasQueuedInstructions ? 'READY' : cleaned ? 'DONE' : 'PAUSED')
         return {
           ...next,
-          status: hasQueuedInstructions ? 'READY' : cleaned ? 'DONE' : 'PAUSED',
+          status,
           countdown: null,
           pending_break: null,
-          break_rejected_by: null
+          break_rejected_by: null,
+          derivation_hold: null
         }
       }
 
@@ -1644,16 +1719,68 @@ export class BuddyRunner {
         }
       }
 
+      if (holdChildren) {
+        return {
+          ...next,
+          status: 'WAITING_CHILDREN',
+          derivation_hold: null,
+          countdown: null,
+          pending_break: breakRejected ? null : next.pending_break,
+          break_rejected_by: breakRejected ? { actor, round } : null
+        }
+      }
+
       return {
         ...next,
         status: roundWindowReached ? 'PAUSED' : 'READY',
         pending_break: breakRejected ? null : next.pending_break,
         break_rejected_by: breakRejected ? { actor, round } : null,
-        countdown: null
+        countdown: null,
+        derivation_hold: null
       }
     })
 
-    if (breakConfirmed) {
+    if (breakConfirmed && breakOutcome === 'await_parent') {
+      await this.store.appendTranscript(taskId, workspaceKey, 'system', '双方已确认本任务完成，等待父任务验收。', { kind: 'round_notice', round })
+      await this.store.appendTaskEvent(taskId, workspaceKey, {
+        type: 'task.awaiting_acceptance',
+        payload: { round }
+      })
+      await this.derivation.notifyParent(taskId, workspaceKey, `子任务 ${currentState.title || taskId} 已完成内部确认，等待验收。`, false)
+      this.onTaskTerminal?.(workspaceKey)
+      return
+    }
+
+    if (breakConfirmed && breakOutcome === 'needs_delivery') {
+      await this.store.appendTranscript(
+        taskId,
+        workspaceKey,
+        'system',
+        '还没有向父任务提交交付，不能进入待验收。请先 submit，再由双方确认结束。',
+        { kind: 'round_notice', round }
+      )
+      await this.store.appendTaskEvent(taskId, workspaceKey, {
+        type: 'task.delivery_required',
+        payload: { round }
+      })
+    }
+
+    if (breakConfirmed && breakOutcome === 'blocked') {
+      const pending = childSnapshots.filter(child => blocksParentCompletion(child)).map(child => child.task_id)
+      await this.store.appendTranscript(
+        taskId,
+        workspaceKey,
+        'system',
+        `还有子任务未验收通过（${pending.join(', ')}），不能结束当前任务。已取消的子任务需要先 waive 并写明原因。`,
+        { kind: 'round_notice', round }
+      )
+      await this.store.appendTaskEvent(taskId, workspaceKey, {
+        type: 'task.completion_blocked',
+        payload: { child_task_ids: pending }
+      })
+    }
+
+    if (breakConfirmed && breakOutcome === 'done') {
       if (!cleaned) { this.onTaskTerminal?.(workspaceKey); return }
       await this.store.appendTaskEvent(taskId, workspaceKey, {
         type: 'actor.finished',
@@ -1744,6 +1871,12 @@ export class BuddyRunner {
         payload: { elapsed_ms: elapsedMs, exit_code: exitCode, buddy_type: buddyType }
       })
     }
+    if (holdChildren) {
+      await this.store.appendTranscript(taskId, workspaceKey, 'system', '父任务开始等待子任务，不再占用执行名额。', { kind: 'round_notice', round })
+      await this.store.appendTaskEvent(taskId, workspaceKey, { type: 'derivation.waiting', payload: {} })
+      this.onTaskTerminal?.(workspaceKey)
+      return
+    }
     if (roundWindowReached) {
       await this.store.appendTranscript(
         taskId,
@@ -1798,6 +1931,27 @@ export class BuddyRunner {
     const stateBefore = await this.store.readTaskState(taskId, workspaceKey)
     const pendingBreak = stateBefore.pending_break
     const otherActorBreak = pendingBreak?.actor && pendingBreak.actor !== actor ? pendingBreak : null
+
+    if (otherActorBreak && stateBefore.parent_task_id) {
+      await this.store.updateTaskState(taskId, workspaceKey, (state) => ({
+        ...state,
+        status: 'FAILED',
+        active_run: null,
+        pending_break: null,
+        latest_failure: failure,
+        last_error: failure,
+        updated_at: failure.ts
+      }))
+      await this.store.appendTaskEvent(taskId, workspaceKey, {
+        type: 'actor.failed',
+        actor,
+        run_id: runId,
+        payload: { error: message, run_id: runId }
+      })
+      await this.derivation.notifyParent(taskId, workspaceKey, `子任务 ${stateBefore.title || taskId} 失败：${message}。父任务可以用 restart ${taskId} 重新启动；要放弃它，先取消再用 waive。`, true)
+      this.onTaskTerminal?.(workspaceKey)
+      return
+    }
 
     if (otherActorBreak) {
       const cleaned = await this.cleanupServices(taskId, workspaceKey)
@@ -1886,7 +2040,19 @@ export class BuddyRunner {
         await this.notifier.notifyTaskFailed(taskId, workspaceKey, actor, message)
       }
     }
+    if (stateBefore.parent_task_id) {
+      await this.derivation.notifyParent(taskId, workspaceKey, `子任务 ${stateBefore.title || taskId} 失败：${message}。父任务可以用 restart ${taskId} 重新启动；要放弃它，先取消再用 waive。`, true)
+    }
     this.onTaskTerminal?.(workspaceKey)
+  }
+
+  private async childSnapshots(state: TaskState, workspaceKey: string): Promise<ChildSnapshot[]> {
+    const snapshots: ChildSnapshot[] = []
+    for (const taskId of state.child_task_ids ?? []) {
+      const child = await this.store.readTaskState(taskId, workspaceKey).catch(() => null)
+      snapshots.push({ task_id: taskId, status: child?.status ?? 'FAILED', waived: Boolean(child?.waiver?.reason) })
+    }
+    return snapshots
   }
 
   /**
@@ -1916,7 +2082,7 @@ export class BuddyRunner {
 
     // Try to generate a summary via LLM first; fall back to simple truncation
     const taskDirectory = this.store.taskDirectory(taskId, workspaceKey)
-    const cwd = await existingCwd(detail.state.repo_root)
+    const cwd = await actorCwd(detail.state)
     const launcher = detail.settings.launchers[actor] ?? {
       command: actor,
       env: {},
@@ -2117,7 +2283,8 @@ function canStartFrom(status: TaskState['status']): boolean {
     status === 'FAILED' ||
     status === 'COUNTDOWN' ||
     status === 'DONE' ||
-    status === 'PINGING'
+    status === 'PINGING' ||
+    status === 'WAITING_CHILDREN'
   )
 }
 
@@ -2347,6 +2514,10 @@ function describeAcpPromptOverflow(result: { status?: string; stopReason?: strin
   if (result.stopReason) parts.push(`stopReason ${result.stopReason}`)
   if (result.status) parts.push(`status ${result.status}`)
   return parts.join(' ')
+}
+
+async function actorCwd(state: { work_dir?: string; repo_root?: string }): Promise<string> {
+  return existingCwd(state.work_dir || state.repo_root)
 }
 
 async function existingCwd(path?: string): Promise<string> {

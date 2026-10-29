@@ -25,12 +25,12 @@ import {
   bindingsEqual,
 } from '../lib/keyboard'
 import type { GlobalSettings, Launcher } from '../../shared/types'
-import { DEFAULT_LAUNCHER_ORDER, KNOWN_ACP_PRESETS, defaultLauncherFor, normalizeGlobalSettings } from '../../shared/defaults'
+import { DEFAULT_DERIVATION_PROMPT, DEFAULT_LAUNCHER_ORDER, KNOWN_ACP_PRESETS, defaultLauncherFor, normalizeGlobalSettings } from '../../shared/defaults'
 import { actorColorVar } from '../lib/format'
 import { CheckCircle, XCircle, Loader2, Zap, AlertCircle, Info, Copy, Check } from 'lucide-react'
 import { Switch } from './Switch'
 
-export type SettingsTab = 'general' | 'appearance' | 'keyboard' | 'prompts'
+export type SettingsTab = 'general' | 'appearance' | 'keyboard' | 'prompts' | 'derivation'
 
 interface SettingsContentProps {
   tab: SettingsTab
@@ -125,7 +125,9 @@ export function SettingsContent({ tab, globalSettings }: SettingsContentProps) {
       ? t('settings.tab.appearance')
       : tab === 'keyboard'
         ? t('settings.tab.keyboard')
-        : t('settings.tab.prompts')
+        : tab === 'derivation'
+          ? t('settings.tab.derivation')
+          : t('settings.tab.prompts')
   return (
     <div className="flex-1 overflow-y-auto bg-bg-elevated">
       <div className="max-w-4xl mx-auto px-10 py-10">
@@ -136,6 +138,8 @@ export function SettingsContent({ tab, globalSettings }: SettingsContentProps) {
           <AppearanceSettings />
         ) : tab === 'keyboard' ? (
           <KeyboardSettings />
+        ) : tab === 'derivation' ? (
+          <DerivationSettings globalSettings={globalSettings} />
         ) : (
           <PromptsSettings globalSettings={globalSettings} />
         )}
@@ -426,6 +430,80 @@ function GeneralSettings({ globalSettings }: { globalSettings: GlobalSettings | 
             }
           />
         </SettingsList>
+      </div>
+    </div>
+  )
+}
+
+function DerivationSettings({ globalSettings }: { globalSettings: GlobalSettings | null }) {
+  const t = useT()
+  const updateMutation = useUpdateGlobalSettings()
+  const normalizedSettings = normalizeGlobalSettings(globalSettings)
+  const saved = normalizedSettings.derivation_prompt ?? DEFAULT_DERIVATION_PROMPT
+  const [draft, setDraft] = useState(saved)
+
+  useEffect(() => {
+    setDraft(normalizedSettings.derivation_prompt ?? DEFAULT_DERIVATION_PROMPT)
+  }, [normalizedSettings.derivation_prompt])
+
+  const save = (patch: Partial<GlobalSettings>) => {
+    updateMutation.mutate({ ...normalizedSettings, ...patch })
+  }
+
+  const dirty = draft !== saved
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <h2 className="text-base font-semibold text-fg mb-1">{t('settings.derivation.title')}</h2>
+        <p className="text-sm text-fg-secondary">{t('settings.derivation.desc')}</p>
+      </div>
+      <SettingsList>
+        <SettingsRow
+          title={t('settings.derivation.nested.title')}
+          description={t('settings.derivation.nested.desc')}
+          right={
+            <Switch
+              checked={normalizedSettings.allow_nested_derivation ?? false}
+              onChange={(value) => save({ allow_nested_derivation: value })}
+              ariaLabel={t('settings.derivation.nested.title')}
+            />
+          }
+        />
+        <div className="px-4 py-4 border-t border-border">
+          <div className="text-sm font-medium text-fg mb-2">{t('settings.derivation.prompt')}</div>
+          <textarea
+            value={draft}
+            rows={14}
+            onChange={(event) => setDraft(event.target.value)}
+            className="w-full px-3 py-2 text-sm bg-transparent border border-border rounded-lg font-mono focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent transition-colors resize-y"
+          />
+        </div>
+      </SettingsList>
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={() => {
+            const next = draft.trim()
+            save({ derivation_prompt: next === DEFAULT_DERIVATION_PROMPT.trim() ? undefined : next || undefined })
+          }}
+          disabled={!dirty}
+          className="px-3 py-2 text-xs font-medium rounded-md bg-accent-primary text-fg-inverse hover:bg-accent-primary-hover disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+        >
+          {t('common.save')}
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            if (!window.confirm(t('settings.derivation.resetConfirm'))) return
+            setDraft(DEFAULT_DERIVATION_PROMPT)
+            save({ derivation_prompt: undefined })
+          }}
+          className="flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-md border border-border hover:bg-bg-subtle transition-colors"
+        >
+          <RotateCcw size={12} />
+          {t('settings.derivation.reset')}
+        </button>
       </div>
     </div>
   )

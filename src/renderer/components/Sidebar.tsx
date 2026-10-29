@@ -1,11 +1,14 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import {
   AlertCircle,
+  ChevronDown,
   ChevronLeft,
+  ChevronRight,
   Copy,
   Ellipsis,
   Folder,
   FolderOpen,
+  GitBranch,
   Keyboard,
   MessageSquare,
   PanelLeft,
@@ -26,7 +29,7 @@ import { useT } from '../hooks/useI18n'
 import type { TFunction } from '../hooks/useI18n'
 import type { TranslationKey } from '../lib/i18n'
 import type { UpdateStatus, UpdaterErrorPhase } from '../hooks/useUpdater'
-import { projectNameForTask, readStringArraySetting, writeStringArraySetting, isTaskUnread, readTaskNames, writeTaskNames, displayNameForTask } from '../lib/taskList'
+import { projectNameForTask, readStringArraySetting, writeStringArraySetting, isTaskUnread, readTaskNames, writeTaskNames, displayNameForTask, taskChildren } from '../lib/taskList'
 import logo from '../assets/logo.png'
 
 import type { SettingsTab } from './SettingsContent'
@@ -203,6 +206,13 @@ function SettingsSidebar({
           active={settingsTab === 'prompts'}
           onClick={() => onSelectSettingsTab('prompts')}
         />
+
+        <SettingsMenuItem
+          label={t('settings.tab.derivation')}
+          icon={<GitBranch size={15} strokeWidth={1.7} />}
+          active={settingsTab === 'derivation'}
+          onClick={() => onSelectSettingsTab('derivation')}
+        />
       </div>
     </>
   )
@@ -296,6 +306,7 @@ function ChatSidebar({
 
   const [pinnedTaskIds, setPinnedTaskIds] = useState<string[]>(() => readStringArraySetting('buddy.pinnedTaskIds'))
   const [collapsedProjectKeys, setCollapsedProjectKeys] = useState<string[]>(() => readStringArraySetting('buddy.collapsedProjectKeys'))
+  const [collapsedTaskIds, setCollapsedTaskIds] = useState<string[]>(() => readStringArraySetting('buddy.collapsedTaskNodes'))
   const [expandedTaskProjects, setExpandedTaskProjects] = useState<Set<string>>(new Set())
   const [confirmState, setConfirmState] = useState<{ title: string; message: string; onConfirm: () => void } | null>(null)
 
@@ -325,6 +336,14 @@ function ChatSidebar({
           return s
         })
       }
+      return next
+    })
+  }, [])
+
+  const toggleTaskNode = useCallback((taskId: string) => {
+    setCollapsedTaskIds(prev => {
+      const next = prev.includes(taskId) ? prev.filter(id => id !== taskId) : [...prev, taskId]
+      writeStringArraySetting('buddy.collapsedTaskNodes', next)
       return next
     })
   }, [])
@@ -457,8 +476,8 @@ function ChatSidebar({
                   const proj = projectNameForTask(task, projectNames)
                   const displayName = displayNameForTask(task, taskNames)
                   return (
+                    <div key={task.task_id}>
                     <div
-                      key={task.task_id}
                       onClick={() => onSelectTask(task.task_id, task.workspace_key)}
                       onContextMenu={(e) => {
                         e.preventDefault()
@@ -508,6 +527,22 @@ function ChatSidebar({
                           </button>
                         </div>
                       </div>
+                    </div>
+                    {!collapsedTaskIds.includes(task.task_id) && (
+                      <NestedTaskList
+                        parentId={task.task_id}
+                        depth={1}
+                        tasks={tasks}
+                        selectedTaskId={selectedTaskId}
+                        taskNames={taskNames}
+                        collapsedTaskIds={collapsedTaskIds}
+                        pinnedTaskIds={pinnedTaskIds}
+                        onToggle={toggleTaskNode}
+                        onSelectTask={onSelectTask}
+                        onOpenMenu={openTaskMenu}
+                        t={t}
+                      />
+                    )}
                     </div>
                   )
                 })}
@@ -570,14 +605,17 @@ function ChatSidebar({
                     <div className="px-3 py-1.5 ml-2 text-xs text-fg-muted">{t('sidebar.noConversation')}</div>
                   ) : (
                     <div className="pt-0.5">
-                      {(expandedTaskProjects.has(projectKey) ? workspaceTasks : workspaceTasks.slice(0, 10)).map((task) => {
+                      {(expandedTaskProjects.has(projectKey) ? workspaceTasks : workspaceTasks.slice(0, 10))
+                        .filter(task => !task.parent_task_id || !tasks.some(item => item.task_id === task.parent_task_id && item.workspace_key === task.workspace_key && (pinnedTaskIds.includes(item.task_id) || workspaceTasks.some(row => row.task_id === item.task_id))))
+                        .map((task) => {
                       const isSelected = selectedTaskId === task.task_id
                       const unread = isTaskUnread(task, selectedTaskId)
                       const displayName = displayNameForTask(task, taskNames)
                       const isPinned = pinnedTaskIds.includes(task.task_id)
+                      const childCount = taskChildren(tasks, task.task_id).length
                       return (
+                        <div key={task.task_id}>
                         <div
-                          key={task.task_id}
                           onClick={() => onSelectTask(task.task_id, task.workspace_key)}
                           onContextMenu={(e) => {
                             e.preventDefault()
@@ -592,12 +630,25 @@ function ChatSidebar({
                           } ${task.status === 'DONE' ? 'task-done' : ''}`}
                         >
                           <div className="flex h-full items-center gap-2">
+                            {childCount > 0 ? (
+                              <button
+                                type="button"
+                                aria-label={collapsedTaskIds.includes(task.task_id) ? t('sidebar.tasksExpand') : t('sidebar.tasksCollapse')}
+                                onClick={(event) => { event.stopPropagation(); toggleTaskNode(task.task_id) }}
+                                className="w-4 h-4 flex items-center justify-center text-fg-muted"
+                              >
+                                {collapsedTaskIds.includes(task.task_id) ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
+                              </button>
+                            ) : null}
                             <TaskStatusIcon status={task.status} dimmed={!unread} />
                             <span className={`text-xs truncate flex-1 ${
                           isSelected ? 'text-fg' : 'text-fg-secondary'
                             }`}>
                               {displayName}
                             </span>
+                            {(task.status === 'WAITING_CHILDREN' || task.status === 'AWAITING_ACCEPTANCE') && (
+                              <span className="text-[10px] text-fg-muted flex-shrink-0">{t(task.status === 'WAITING_CHILDREN' ? 'status.WAITING_CHILDREN' : 'status.AWAITING_ACCEPTANCE')}</span>
+                            )}
                             {task.updated_at && (
                               <span className="text-xs text-fg-muted flex-shrink-0 group-hover/task:hidden">
                                 {formatRelativeTime(task.updated_at, t)}
@@ -626,6 +677,22 @@ function ChatSidebar({
                               </button>
                             </div>
                           </div>
+                        </div>
+                        {!collapsedTaskIds.includes(task.task_id) && (
+                          <NestedTaskList
+                            parentId={task.task_id}
+                            depth={1}
+                            tasks={tasks}
+                            selectedTaskId={selectedTaskId}
+                            taskNames={taskNames}
+                            collapsedTaskIds={collapsedTaskIds}
+                            pinnedTaskIds={pinnedTaskIds}
+                            onToggle={toggleTaskNode}
+                            onSelectTask={onSelectTask}
+                            onOpenMenu={openTaskMenu}
+                            t={t}
+                          />
+                        )}
                         </div>
                       )
                     })}
@@ -812,6 +879,97 @@ function FolderIcon({ isOpen }: { isOpen: boolean }) {
   return isOpen
     ? <FolderOpen size={14} strokeWidth={2} className="flex-shrink-0" />
     : <Folder size={14} strokeWidth={2} className="flex-shrink-0" />
+}
+
+function NestedTaskList({
+  parentId,
+  depth,
+  tasks,
+  selectedTaskId,
+  taskNames,
+  collapsedTaskIds,
+  pinnedTaskIds,
+  onToggle,
+  onSelectTask,
+  onOpenMenu,
+  t
+}: {
+  parentId: string
+  depth: number
+  tasks: Task[]
+  selectedTaskId: string | null
+  taskNames: Record<string, string>
+  collapsedTaskIds: string[]
+  pinnedTaskIds: string[]
+  onToggle: (taskId: string) => void
+  onSelectTask: (taskId: string, workspaceKey: string) => void
+  onOpenMenu: (task: Task, displayName: string, isPinned: boolean, anchor: SidebarMenuAnchor) => void
+  t: TFunction
+}) {
+  const children = taskChildren(tasks, parentId)
+  if (children.length === 0) return null
+  return (
+    <>
+      {children.map(task => {
+        const isSelected = selectedTaskId === task.task_id
+        const unread = isTaskUnread(task, selectedTaskId)
+        const displayName = displayNameForTask(task, taskNames)
+        const isPinned = pinnedTaskIds.includes(task.task_id)
+        const nested = taskChildren(tasks, task.task_id)
+        const collapsed = collapsedTaskIds.includes(task.task_id)
+        return (
+          <div key={task.task_id}>
+            <div
+              onClick={() => onSelectTask(task.task_id, task.workspace_key)}
+              onContextMenu={(event) => {
+                event.preventDefault()
+                event.stopPropagation()
+                onOpenMenu(task, displayName, isPinned, { x: event.clientX, y: event.clientY, align: 'left' })
+              }}
+              title={`${displayName}\n${task.status}`}
+              className={`group/task w-full h-7 text-left pr-3 rounded-md mb-0.5 transition-colors cursor-pointer ${
+                isSelected ? 'bg-bg-subtle' : 'hover:bg-bg-subtle'
+              } ${task.status === 'DONE' ? 'task-done' : ''}`}
+              style={{ paddingLeft: 12 + depth * 14 }}
+            >
+              <div className="flex h-full items-center gap-2">
+                {nested.length > 0 ? (
+                  <button
+                    type="button"
+                    aria-label={collapsed ? t('sidebar.tasksExpand') : t('sidebar.tasksCollapse')}
+                    onClick={(event) => { event.stopPropagation(); onToggle(task.task_id) }}
+                    className="w-4 h-4 flex items-center justify-center text-fg-muted"
+                  >
+                    {collapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
+                  </button>
+                ) : <span className="w-4" />}
+                <TaskStatusIcon status={task.status} dimmed={!unread} />
+                <span className={`text-xs truncate flex-1 ${isSelected ? 'text-fg' : 'text-fg-secondary'}`}>{displayName}</span>
+                {(task.status === 'WAITING_CHILDREN' || task.status === 'AWAITING_ACCEPTANCE') && (
+                  <span className="text-[10px] text-fg-muted flex-shrink-0">{t(task.status === 'WAITING_CHILDREN' ? 'status.WAITING_CHILDREN' : 'status.AWAITING_ACCEPTANCE')}</span>
+                )}
+              </div>
+            </div>
+            {!collapsed && (
+              <NestedTaskList
+                parentId={task.task_id}
+                depth={depth + 1}
+                tasks={tasks}
+                selectedTaskId={selectedTaskId}
+                taskNames={taskNames}
+                collapsedTaskIds={collapsedTaskIds}
+                pinnedTaskIds={pinnedTaskIds}
+                onToggle={onToggle}
+                onSelectTask={onSelectTask}
+                onOpenMenu={onOpenMenu}
+                t={t}
+              />
+            )}
+          </div>
+        )
+      })}
+    </>
+  )
 }
 
 function formatRelativeTime(iso: string, t: TFunction): string {

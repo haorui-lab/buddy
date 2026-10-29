@@ -22,7 +22,7 @@ interface TitleBarProps {
 }
 
 interface CompactStatusInfo {
-  cls: 'running' | 'paused' | 'done' | 'danger'
+  cls: 'running' | 'paused' | 'done' | 'danger' | 'ready'
   labelKey: TranslationKey
   pulse: boolean
 }
@@ -40,6 +40,8 @@ function compactStatusInfo(status: TaskStatus | null | undefined): CompactStatus
   if (status === 'CANCELLED') return { cls: 'paused', labelKey: 'status.CANCELLED', pulse: false }
   if (status === 'FAILED') return { cls: 'danger', labelKey: 'status.FAILED', pulse: false }
   if (status === 'QUEUED') return { cls: 'paused', labelKey: 'status.QUEUED', pulse: false }
+  if (status === 'WAITING_CHILDREN') return { cls: 'paused', labelKey: 'status.WAITING_CHILDREN', pulse: false }
+  if (status === 'AWAITING_ACCEPTANCE') return { cls: 'ready', labelKey: 'status.AWAITING_ACCEPTANCE', pulse: false }
   return null
 }
 

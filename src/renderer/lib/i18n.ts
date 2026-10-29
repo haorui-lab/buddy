@@ -111,6 +111,8 @@ const en = {
   'task.cancelHint': 'End this task and clean up its services; keep external or explicitly retained services',
   'status.PINGING': 'Health check…',
   'status.QUEUED': 'Queued',
+  'status.WAITING_CHILDREN': 'Waiting for subtasks',
+  'status.AWAITING_ACCEPTANCE': 'Awaiting acceptance',
   'status.QUEUED_POSITION': 'Queued · #{n}',
   'status.QUEUED_SUPERSEDED': 'Awaiting manual run',
 
@@ -168,6 +170,7 @@ const en = {
   'settings.tab.appearance': 'Appearance',
   'settings.tab.keyboard': 'Keyboard Shortcuts',
   'settings.tab.prompts': 'Prompts',
+  'settings.tab.derivation': 'Task derivation',
 
   // Settings — General
   'settings.general.section.title': 'General',
@@ -233,6 +236,18 @@ const en = {
   'settings.prompts.placeholder': 'Optional; leave empty to append nothing',
   'settings.prompts.resetToDefault': 'Clear',
   'settings.prompts.resetConfirm': 'Clear the custom prompt?',
+  'settings.derivation.title': 'Task derivation',
+  'settings.derivation.desc': 'Controls whether subtasks can create their own subtasks, and the prompt both actors see.',
+  'settings.derivation.nested.title': 'Allow subtasks to derive further',
+  'settings.derivation.nested.desc': 'Off: only a root task can create subtasks. On: subtasks may continue deriving, still with agreement from both actors.',
+  'settings.derivation.prompt': 'Derivation prompt',
+  'settings.derivation.reset': 'Restore default',
+  'settings.derivation.resetConfirm': 'Restore the default derivation prompt?',
+  'derivation.backToParent': 'Back to parent task',
+  'derivation.children': 'Subtasks',
+  'derivation.delivery': 'Delivery',
+  'derivation.acceptance': 'Acceptance',
+  'derivation.workDir': 'Work directory',
 
   // Settings — Test Launcher
   'settings.launcher.test': 'Test',
@@ -614,6 +629,8 @@ const zhCN: typeof en = {
   'task.cancelHint': '结束任务并清理其服务；保留外部服务和明确要求保留的服务',
   'status.PINGING': '连通性检查…',
   'status.QUEUED': '排队中',
+  'status.WAITING_CHILDREN': '等待子任务',
+  'status.AWAITING_ACCEPTANCE': '待验收',
   'status.QUEUED_POSITION': '排队中 · 第 {n} 位',
   'status.QUEUED_SUPERSEDED': '等待人工处理',
 
@@ -668,6 +685,7 @@ const zhCN: typeof en = {
   'settings.tab.appearance': '外观',
   'settings.tab.keyboard': '键盘快捷键',
   'settings.tab.prompts': '提示词',
+  'settings.tab.derivation': '任务派生',
 
   'settings.general.section.title': '常规',
   'settings.general.section.desc': '语言与发送方式偏好。',
@@ -731,6 +749,18 @@ const zhCN: typeof en = {
   'settings.prompts.placeholder': '可选；留空则不追加任何内容',
   'settings.prompts.resetToDefault': '清空',
   'settings.prompts.resetConfirm': '确定清空自定义提示词吗？',
+  'settings.derivation.title': '任务派生',
+  'settings.derivation.desc': '控制子任务能否继续派生，以及两位 Actor 看到的派生提示词。',
+  'settings.derivation.nested.title': '允许子任务继续派生',
+  'settings.derivation.nested.desc': '关闭时只有根任务能创建子任务。开启后子任务可以继续向下派生，每次仍须两位 Actor 同意。',
+  'settings.derivation.prompt': '派生提示词',
+  'settings.derivation.reset': '恢复默认',
+  'settings.derivation.resetConfirm': '恢复默认派生提示词？',
+  'derivation.backToParent': '返回父任务',
+  'derivation.children': '子任务',
+  'derivation.delivery': '交付',
+  'derivation.acceptance': '验收',
+  'derivation.workDir': '工作目录',
 
   // 设置 — 测试 Launcher
   'settings.launcher.test': '测试',
@@ -1100,6 +1130,8 @@ const zhTW: typeof en = {
   'task.cancelHint': '結束任務並清理其服務；保留外部服務和明確要求保留的服務',
   'status.PINGING': '連通性檢查…',
   'status.QUEUED': '排隊中',
+  'status.WAITING_CHILDREN': '等待子任務',
+  'status.AWAITING_ACCEPTANCE': '待驗收',
   'status.QUEUED_POSITION': '排隊中 · 第 {n} 位',
   'status.QUEUED_SUPERSEDED': '等待人工處理',
 
@@ -1215,6 +1247,18 @@ const zhTW: typeof en = {
   'settings.prompts.placeholder': '可選；留空則不追加任何內容',
   'settings.prompts.resetToDefault': '清空',
   'settings.prompts.resetConfirm': '確定清空自訂提示詞嗎？',
+  'settings.derivation.title': '任務派生',
+  'settings.derivation.desc': '控制子任務能否繼續派生，以及兩位 Actor 看到的派生提示詞。',
+  'settings.derivation.nested.title': '允許子任務繼續派生',
+  'settings.derivation.nested.desc': '關閉時只有根任務能建立子任務。開啟後子任務可以繼續向下派生，每次仍須兩位 Actor 同意。',
+  'settings.derivation.prompt': '派生提示詞',
+  'settings.derivation.reset': '恢復預設',
+  'settings.derivation.resetConfirm': '恢復預設派生提示詞？',
+  'derivation.backToParent': '返回父任務',
+  'derivation.children': '子任務',
+  'derivation.delivery': '交付',
+  'derivation.acceptance': '驗收',
+  'derivation.workDir': '工作目錄',
 
   // 設定 — 測試 Launcher
   'settings.launcher.test': '測試',
@@ -1471,6 +1515,7 @@ const zhTW: typeof en = {
   // Settings - Keyboard shortcuts tab
   'settings.tab.keyboard': '鍵盤快速鍵',
   'settings.tab.prompts': '提示詞',
+  'settings.tab.derivation': '任務派生',
   'shortcuts.search': '搜尋快速鍵…',
   'shortcuts.resetAll': '全部恢復預設',
   'shortcuts.resetAllConfirm': '確定將所有快速鍵恢復為預設值？',

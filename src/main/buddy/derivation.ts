@@ -1,0 +1,925 @@
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { execFile } from 'node:child_process'
+import { createServer } from 'node:http'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+import clientSource from './derivation-client.cjs?raw'
+import type {
+  DerivationProposal,
+  DerivationSpec,
+  GlobalSettings,
+  TaskDelivery,
+  TaskSettings,
+  TaskState,
+  TaskStatus
+} from '../../shared/types'
+import { DEFAULT_DERIVATION_PROMPT, normalizeGlobalSettings } from '../../shared/defaults'
+import { implementerActor, reviewerActor } from './prompts'
+import type { BuddyEventBus } from './events'
+import type { BuddyStore } from './store'
+
+const KEY_PATTERN = /^[a-zA-Z0-9._-]{1,40}$/
+
+export interface ChildSnapshot {
+  task_id: string
+  status: TaskStatus
+  waived?: boolean
+}
+
+export interface DerivationHooks {
+  startTask: (taskId: string, workspaceKey: string) => Promise<unknown>
+  terminal: (workspaceKey: string) => void
+  cleanup: (taskId: string, workspaceKey: string) => Promise<boolean>
+  events?: BuddyEventBus
+}
+
+export interface DerivationSession {
+  env: Record<string, string>
+  close: () => void
+}
+
+export function derivationPermission(input: {
+  depth: number
+  status: TaskStatus
+  allowNested: boolean
+}): { allowed: boolean; reason: string } {
+  if (input.status === 'CANCELLED') return { allowed: false, reason: '任务已取消，不能派生' }
+  if (input.status === 'DONE') return { allowed: false, reason: '任务已结束，不能派生' }
+  if (input.status === 'AWAITING_ACCEPTANCE') return { allowed: false, reason: '当前任务正在等待父任务验收，不能再派生' }
+  if (input.depth >= 1 && !input.allowNested) {
+    return { allowed: false, reason: '全局开关关闭，子任务不能继续派生' }
+  }
+  return { allowed: true, reason: input.depth >= 1 ? '允许继续向下派生' : '允许创建一级子任务' }
+}
+
+export function proposalHash(specs: DerivationSpec[]): string {
+  return createHash('sha256').update(JSON.stringify(specs.map(canonicalSpec))).digest('hex')
+}
+
+export function derivedTaskId(parentId: string, specKey: string): string {
+  const digest = createHash('sha256').update(`${parentId}\n${specKey}`).digest('hex').slice(0, 10)
+  const slug = specKey.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24) || 'sub'
+  const id = `${slug}-${digest}`
+  return [...id].length > 64 ? digest : id
+}
+
+export function validateSpecs(input: unknown): DerivationSpec[] {
+  if (!Array.isArray(input) || input.length === 0) throw new Error('派生方案至少要包含一个子任务')
+  if (input.length > 20) throw new Error('一次最多提出 20 个子任务')
+  const specs = input.map(readSpec)
+  const keys = new Set<string>()
+  for (const spec of specs) {
+    if (keys.has(spec.key)) throw new Error(`子任务标识重复：${spec.key}`)
+    keys.add(spec.key)
+  }
+  const color = new Map<string, number>()
+  const byKey = new Map(specs.map(spec => [spec.key, spec]))
+  const visit = (key: string): void => {
+    const state = color.get(key) ?? 0
+    if (state === 1) throw new Error(`子任务依赖成环：${key}`)
+    if (state === 2) return
+    color.set(key, 1)
+    for (const dep of byKey.get(key)?.dependencies ?? []) {
+      if (!keys.has(dep)) throw new Error(`依赖的子任务不在本次方案中：${dep}`)
+      visit(dep)
+    }
+    color.set(key, 2)
+  }
+  for (const spec of specs) visit(spec.key)
+  return specs
+}
+
+export function latestDecisions(proposal: DerivationProposal): Map<string, DerivationProposal['decisions'][number]> {
+  const map = new Map<string, DerivationProposal['decisions'][number]>()
+  for (const decision of proposal.decisions) {
+    if (decision.proposal_hash !== proposal.proposal_hash) continue
+    map.set(decision.actor, decision)
+  }
+  return map
+}
+
+export function bothAgreed(proposal: DerivationProposal, actors: [string, string]): boolean {
+  const decisions = latestDecisions(proposal)
+  return actors.every(actor => decisions.get(actor)?.decision === 'agree')
+}
+
+/** 已完成，或已取消且父任务明确解除必要性的子任务，不再挡住父任务。 */
+export function blocksParentCompletion(child: { status: TaskStatus; waived?: boolean }): boolean {
+  if (child.status === 'DONE') return false
+  if (child.status === 'CANCELLED' && child.waived) return false
+  return true
+}
+
+/** 必要子任务未验收通过时，父任务不能结束。子任务要先提交交付，双方确认后才进入待验收。 */
+export function resolveBreakOutcome(
+  state: { parent_task_id?: string | null; delivery?: { version?: string } | null },
+  children: ChildSnapshot[]
+): 'done' | 'await_parent' | 'blocked' | 'needs_delivery' {
+  if (children.some(child => blocksParentCompletion(child))) return 'blocked'
+  if (state.parent_task_id) {
+    if (!state.delivery?.version) return 'needs_delivery'
+    return 'await_parent'
+  }
+  return 'done'
+}
+
+export function shouldEnterChildWait(
+  state: { derivation_hold?: 'children' | null },
+  breakConfirmed: boolean,
+  breakPending: boolean
+): boolean {
+  return state.derivation_hold === 'children' && !breakConfirmed && !breakPending
+}
+
+export function formatDerivationSection(input: {
+  allowed: boolean
+  reason: string
+  prompt: string
+  proposal: DerivationProposal | null
+  actors: { implementer: string; reviewer: string }
+  children: Array<{
+    task_id: string
+    title?: string
+    status: string
+    work_dir?: string
+    delivery?: TaskState['delivery']
+    acceptance?: TaskState['acceptance']
+    waived?: boolean
+  }>
+  workDir?: string
+  session?: Record<string, string>
+}): string {
+  const lines = [
+    input.prompt.trim(),
+    '',
+    `当前派生权限：${input.allowed ? '允许' : '不允许'}。${input.reason}`,
+    input.workDir ? `当前任务工作目录：${input.workDir}` : '',
+    '',
+    '已有子任务：'
+  ]
+  if (input.children.length === 0) lines.push('- 无')
+  for (const child of input.children) {
+    const review = child.acceptance
+      ? `；验收 ${child.acceptance.decision === 'accept' ? '通过' : '退回'}：${child.acceptance.comment}`
+      : ''
+    const waived = child.waived ? '；已解除必要性' : ''
+    const version = child.delivery?.version ? `；交付版本 ${child.delivery.version}` : ''
+    lines.push(`- ${child.task_id} ${child.title || ''} 状态 ${child.status}${child.work_dir ? `；目录 ${child.work_dir}` : ''}${version}${review}${waived}`)
+  }
+  lines.push('', '当前方案确认进度：')
+  if (!input.proposal || input.proposal.status === 'rejected') {
+    lines.push('- 没有待确认方案')
+  } else {
+    const decisions = latestDecisions(input.proposal)
+    lines.push(`- 方案 ${input.proposal.proposal_id} 版本 ${input.proposal.proposal_hash.slice(0, 12)} 状态 ${input.proposal.status}`)
+    for (const actor of [input.actors.implementer, input.actors.reviewer]) {
+      const decision = decisions.get(actor)
+      lines.push(`- ${actor}：${decision ? `${decision.decision === 'agree' ? '同意' : '不同意'} ${decision.reason}` : '未表态'}`)
+    }
+    if (input.proposal.created_task_ids.length > 0) {
+      lines.push(`- 已创建：${input.proposal.created_task_ids.join(', ')}`)
+    }
+  }
+  const command = (args: string) => derivationCommand(input.session, args)
+  lines.push(
+    '',
+    '派生操作（只记录你自己的决定，不能代替另一位 Actor）：',
+    '有些 Actor 的登录 shell 不会继承环境变量。请原样执行下面的命令，不要改成只依赖 $BUDDY_DERIVATION_NODE。',
+    command('status'),
+    command('propose spec.json'),
+    command('decide agree 理由'),
+    command('decide disagree 理由'),
+    command('create'),
+    command('wait'),
+    command('submit --version VERSION --artifacts PATHS --verification RESULT --issues TEXT'),
+    command('review CHILD_TASK_ID accept 意见'),
+    command('review CHILD_TASK_ID reject 意见'),
+    command('waive CHILD_TASK_ID 原因'),
+    command('restart CHILD_TASK_ID'),
+    '',
+    'spec.json 形如 {"specs":[{"key":"api","title":"标题","goal":"目标","scope":"范围","context":"上下文","dependencies":[],"deliverables":"交付物","acceptance":"验收条件"}]}。',
+    '独立子任务会真正并行启动。修改方案后必须双方重新确认。重复创建不会产生第二份任务。',
+    '已取消的子任务会挡住父任务结束，除非父任务用 waive 写明原因并解除必要性。失败的子任务用 restart 重新启动；要放弃它，先取消再用 waive。',
+    '子任务必须先 submit，再由双方确认结束。没有交付记录时，不会进入父任务验收。'
+  )
+  return lines.filter(line => line !== undefined).join('\n')
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+/** 把本回合的 socket 和 token 写进命令。Codex 的登录 shell 不会继承父进程环境变量。 */
+export function derivationCommand(session: Record<string, string> | undefined, args: string): string {
+  const node = session?.BUDDY_DERIVATION_NODE
+  const cli = session?.BUDDY_DERIVATION_CLI
+  const socket = session?.BUDDY_DERIVATION_SOCKET
+  const token = session?.BUDDY_DERIVATION_TOKEN
+  if (!node || !cli || !socket || !token) {
+    return `ELECTRON_RUN_AS_NODE=1 "$BUDDY_DERIVATION_NODE" "$BUDDY_DERIVATION_CLI" ${args}`
+  }
+  return `BUDDY_DERIVATION_SOCKET=${shellQuote(socket)} BUDDY_DERIVATION_TOKEN=${shellQuote(token)} ELECTRON_RUN_AS_NODE=1 ${shellQuote(node)} ${shellQuote(cli)} ${args}`
+}
+
+function canonicalSpec(spec: DerivationSpec): DerivationSpec {
+  return {
+    key: spec.key,
+    title: spec.title,
+    goal: spec.goal,
+    scope: spec.scope,
+    context: spec.context,
+    dependencies: [...spec.dependencies],
+    deliverables: spec.deliverables,
+    acceptance: spec.acceptance
+  }
+}
+
+function readSpec(value: unknown): DerivationSpec {
+  if (!value || typeof value !== 'object') throw new Error('子任务方案格式不正确')
+  const raw = value as Record<string, unknown>
+  const key = typeof raw.key === 'string' ? raw.key.trim() : ''
+  if (!KEY_PATTERN.test(key)) throw new Error('子任务 key 只能使用字母、数字、点、下划线和短横线，最长 40 字符')
+  const title = typeof raw.title === 'string' ? raw.title.trim() : ''
+  if (!title) throw new Error(`子任务 ${key} 缺少标题`)
+  const text = (field: string, limit = 8000) => {
+    const item = raw[field]
+    const valueText = typeof item === 'string' ? item.trim() : ''
+    if ([...valueText].length > limit) throw new Error(`子任务 ${key} 的 ${field} 过长`)
+    return valueText
+  }
+  const dependencies = Array.isArray(raw.dependencies)
+    ? raw.dependencies.filter((item): item is string => typeof item === 'string').map(item => item.trim()).filter(Boolean)
+    : []
+  return {
+    key,
+    title,
+    goal: text('goal'),
+    scope: text('scope'),
+    context: text('context'),
+    dependencies,
+    deliverables: text('deliverables'),
+    acceptance: text('acceptance')
+  }
+}
+
+function utcNow(): string {
+  return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z')
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function actorsOf(settings: TaskSettings): [string, string] {
+  return [implementerActor(settings), reviewerActor(settings)]
+}
+
+function taskTextOf(spec: DerivationSpec, parentId: string): string {
+  return [
+    `# ${spec.title}`,
+    '',
+    `父任务：${parentId}`,
+    '',
+    '## 目标',
+    spec.goal || '（未填写）',
+    '',
+    '## 工作范围',
+    spec.scope || '（未填写）',
+    '',
+    '## 必要上下文',
+    spec.context || '（未填写）',
+    '',
+    '## 依赖',
+    spec.dependencies.length ? spec.dependencies.join(', ') : '无',
+    '',
+    '## 交付物',
+    spec.deliverables || '（未填写）',
+    '',
+    '## 验收条件',
+    spec.acceptance || '（未填写）'
+  ].join('\n')
+}
+
+function childSettings(parent: TaskSettings): Record<string, unknown> {
+  return {
+    ...parent,
+    seed_claude_session_id: '',
+    seed_codex_thread_id: '',
+    seed_cursor_session_id: '',
+    seed_agy_session_id: '',
+    seed_opencode_session_id: '',
+    seed_kimi_session_id: '',
+    seed_wecode_claude_session_id: '',
+    seed_wecode_codex_thread_id: '',
+    seed_wecode_opencode_session_id: ''
+  }
+}
+
+async function runGit(repo: string, args: string[]): Promise<{ ok: boolean; stdout: string }> {
+  return new Promise(resolve => {
+    execFile('git', ['-C', repo, ...args], { timeout: 20000 }, (error, stdout) => {
+      resolve({ ok: !error, stdout: `${stdout || ''}`.trim() })
+    })
+  })
+}
+
+export class DerivationService {
+  private readonly tails = new Map<string, Promise<unknown>>()
+  private clientPath: Promise<string> | null = null
+
+  constructor(
+    private readonly store: BuddyStore,
+    private readonly hooks: DerivationHooks
+  ) {}
+
+  async promptSection(taskId: string, workspaceKey: string, globalSettings?: GlobalSettings, session?: Record<string, string>): Promise<string> {
+    const state = await this.store.readTaskState(taskId, workspaceKey)
+    const settings = await this.store.readTaskSettings(taskId, workspaceKey)
+    const global = normalizeGlobalSettings(globalSettings ?? await this.store.readGlobalSettings())
+    const permission = derivationPermission({
+      depth: state.derivation_depth ?? (state.parent_task_id ? 1 : 0),
+      status: state.status,
+      allowNested: global.allow_nested_derivation ?? false
+    })
+    const children = []
+    for (const childId of state.child_task_ids ?? []) {
+      try {
+        const child = await this.store.readTaskState(childId, workspaceKey)
+        children.push({
+          task_id: childId,
+          title: child.title,
+          status: child.status,
+          work_dir: child.work_dir,
+          delivery: child.delivery,
+          acceptance: child.acceptance,
+          waived: Boolean(child.waiver?.reason)
+        })
+      } catch {
+        children.push({ task_id: childId, status: 'MISSING' })
+      }
+    }
+    return formatDerivationSection({
+      allowed: permission.allowed,
+      reason: permission.reason,
+      prompt: global.derivation_prompt?.trim() || DEFAULT_DERIVATION_PROMPT,
+      proposal: state.derivation_proposal ?? null,
+      actors: { implementer: implementerActor(settings), reviewer: reviewerActor(settings) },
+      children,
+      workDir: state.work_dir,
+      session
+    })
+  }
+
+  async status(taskId: string, workspaceKey: string) {
+    const state = await this.store.readTaskState(taskId, workspaceKey)
+    const settings = await this.store.readTaskSettings(taskId, workspaceKey)
+    const global = normalizeGlobalSettings(await this.store.readGlobalSettings())
+    const permission = derivationPermission({
+      depth: state.derivation_depth ?? (state.parent_task_id ? 1 : 0),
+      status: state.status,
+      allowNested: global.allow_nested_derivation ?? false
+    })
+    return {
+      allowed: permission.allowed,
+      reason: permission.reason,
+      actors: actorsOf(settings),
+      children: state.child_task_ids ?? [],
+      proposal: state.derivation_proposal ?? null,
+      delivery: state.delivery ?? null,
+      acceptance: state.acceptance ?? null,
+      work_dir: state.work_dir ?? null
+    }
+  }
+
+  propose(taskId: string, workspaceKey: string, actor: string, specsInput: unknown): Promise<DerivationProposal> {
+    return this.lock(`${workspaceKey}:${taskId}`, async () => {
+      const state = await this.store.readTaskState(taskId, workspaceKey)
+      this.assertMutable(state)
+      const permission = await this.permissionFor(state)
+      if (!permission.allowed) throw new Error(permission.reason)
+      const specs = validateSpecs(specsInput)
+      const hash = proposalHash(specs)
+      const current = state.derivation_proposal
+      if (current && current.status === 'open' && current.proposal_hash === hash) return current
+      const proposal: DerivationProposal = {
+        proposal_id: randomUUID(),
+        proposal_hash: hash,
+        specs,
+        proposed_by: actor,
+        proposed_at: utcNow(),
+        decisions: [],
+        created_task_ids: [],
+        status: 'open'
+      }
+      await this.store.updateTaskState(taskId, workspaceKey, currentState => ({
+        ...currentState,
+        derivation_proposal: proposal,
+        updated_at: utcNow()
+      }))
+      await this.note(taskId, workspaceKey, 'derivation.proposed', `${actor} 提出了派生方案 ${proposal.proposal_id}，共 ${specs.length} 个子任务。双方需要分别确认这一版。`, { proposal_id: proposal.proposal_id, proposal_hash: hash })
+      return proposal
+    })
+  }
+
+  decide(
+    taskId: string,
+    workspaceKey: string,
+    actor: string,
+    decision: 'agree' | 'disagree',
+    reason: string
+  ): Promise<DerivationProposal> {
+    return this.lock(`${workspaceKey}:${taskId}`, async () => {
+      const state = await this.store.readTaskState(taskId, workspaceKey)
+      this.assertMutable(state)
+      const settings = await this.store.readTaskSettings(taskId, workspaceKey)
+      const actors = actorsOf(settings)
+      if (!actors.includes(actor)) throw new Error('只有当前任务的两位 Actor 可以确认派生方案')
+      const permission = await this.permissionFor(state)
+      if (!permission.allowed) throw new Error(permission.reason)
+      const proposal = state.derivation_proposal
+      if (!proposal || proposal.status !== 'open') throw new Error('当前没有等待确认的派生方案')
+      const next: DerivationProposal = {
+        ...proposal,
+        decisions: [
+          ...proposal.decisions,
+          { actor, decision, reason: reason.trim(), proposal_hash: proposal.proposal_hash, at: utcNow() }
+        ]
+      }
+      await this.store.updateTaskState(taskId, workspaceKey, current => ({
+        ...current,
+        derivation_proposal: next,
+        updated_at: utcNow()
+      }))
+      await this.note(taskId, workspaceKey, 'derivation.decided', `${actor} ${decision === 'agree' ? '同意' : '不同意'}派生方案。${reason.trim()}`, {
+        actor,
+        decision,
+        proposal_hash: proposal.proposal_hash
+      })
+      return next
+    })
+  }
+
+  create(taskId: string, workspaceKey: string): Promise<{ task_ids: string[]; reused: boolean }> {
+    return this.lock(`${workspaceKey}:${taskId}`, async () => {
+      const state = await this.store.readTaskState(taskId, workspaceKey)
+      const settings = await this.store.readTaskSettings(taskId, workspaceKey)
+      this.assertMutable(state)
+      const proposal = state.derivation_proposal
+      if (!proposal || proposal.status === 'rejected') throw new Error('没有可创建的派生方案')
+      if (proposal.status === 'created' && proposal.created_task_ids.length > 0) {
+        return { task_ids: proposal.created_task_ids, reused: true }
+      }
+      const permission = await this.permissionFor(state)
+      if (!permission.allowed) throw new Error(`创建前复核未通过：${permission.reason}`)
+      const actors = actorsOf(settings)
+      if (!bothAgreed(proposal, actors)) throw new Error('同一方案还没有得到两位 Actor 的明确同意')
+      const idByKey = new Map(proposal.specs.map(spec => [spec.key, derivedTaskId(taskId, spec.key)]))
+      const created: string[] = []
+      for (const spec of proposal.specs) {
+        const childId = idByKey.get(spec.key)!
+        const dependsOn = spec.dependencies.map(key => idByKey.get(key)!).filter(Boolean)
+        const existing = await this.store.readTaskState(childId, workspaceKey).catch(() => null)
+        if (existing) {
+          if (existing.parent_task_id !== taskId || existing.spec_key !== spec.key) {
+            throw new Error(`子任务标识已被占用：${childId}`)
+          }
+          created.push(childId)
+          continue
+        }
+        const workDir = await this.allocateWorkDir(state.repo_root || '', workspaceKey, childId)
+        await this.store.createTask({
+          task_id: childId,
+          repo_root: state.repo_root,
+          workspace_key: workspaceKey,
+          task_text: taskTextOf(spec, taskId),
+          context_text: spec.context,
+          settings: childSettings(settings),
+          execution_mode: state.execution_mode ?? 'immediate',
+          parent_task_id: taskId,
+          root_task_id: state.root_task_id || state.task_id || taskId,
+          derivation_depth: (state.derivation_depth ?? 0) + 1,
+          title: spec.title,
+          work_dir: workDir,
+          spec_key: spec.key,
+          depends_on_task_ids: dependsOn,
+          dependency_blocked: dependsOn.length > 0
+        })
+        created.push(childId)
+      }
+      const saved: DerivationProposal = { ...proposal, status: 'created', created_task_ids: created }
+      await this.store.updateTaskState(taskId, workspaceKey, current => ({
+        ...current,
+        derivation_proposal: saved,
+        child_task_ids: [...new Set([...(current.child_task_ids ?? []), ...created])],
+        updated_at: utcNow()
+      }))
+      await this.note(taskId, workspaceKey, 'derivation.created', `已创建子任务：${created.join(', ')}。`, { task_ids: created })
+      const ready = []
+      for (const childId of created) {
+        const child = await this.store.readTaskState(childId, workspaceKey)
+        if (!child.dependency_blocked && child.status !== 'DONE' && child.status !== 'CANCELLED' && !child.status.startsWith('RUNNING')) {
+          ready.push(childId)
+        }
+      }
+      if ((state.execution_mode ?? 'immediate') === 'queued') {
+        this.hooks.terminal(workspaceKey)
+      } else {
+        await this.kickAll(ready, workspaceKey)
+      }
+      return { task_ids: created, reused: false }
+    })
+  }
+
+  async wait(taskId: string, workspaceKey: string): Promise<{ waiting: boolean; deferred: boolean }> {
+    const state = await this.store.readTaskState(taskId, workspaceKey)
+    this.assertMutable(state)
+    if ((state.child_task_ids ?? []).length === 0) throw new Error('当前任务还没有子任务，不能等待')
+    if (state.active_run) {
+      await this.store.updateTaskState(taskId, workspaceKey, current => ({
+        ...current,
+        derivation_hold: 'children',
+        updated_at: utcNow()
+      }))
+      return { waiting: false, deferred: true }
+    }
+    await this.enterWait(taskId, workspaceKey)
+    return { waiting: true, deferred: false }
+  }
+
+  submit(taskId: string, workspaceKey: string, actor: string, input: {
+    version?: string
+    artifacts?: string
+    verification?: string
+    open_issues?: string
+  }): Promise<TaskDelivery> {
+    return this.lock(`${workspaceKey}:${taskId}`, async () => {
+      const state = await this.store.readTaskState(taskId, workspaceKey)
+      if (state.status === 'CANCELLED') throw new Error('任务已取消，不能提交')
+      if (!state.parent_task_id) throw new Error('只有子任务需要向父任务提交交付')
+      const version = (input.version || '').trim() || await this.headVersion(state.work_dir) || 'unversioned'
+      const delivery: TaskDelivery = {
+        version,
+        artifacts: input.artifacts?.trim() || '',
+        verification: input.verification?.trim() || '',
+        open_issues: input.open_issues?.trim() || '',
+        submitted_at: utcNow(),
+        submitted_by: actor
+      }
+      await this.store.updateTaskState(taskId, workspaceKey, current => ({
+        ...current,
+        delivery,
+        updated_at: utcNow()
+      }))
+      await this.note(taskId, workspaceKey, 'derivation.submitted', `${actor} 提交了交付，版本 ${version}。`, { version })
+      await this.notifyParent(taskId, workspaceKey, `子任务 ${state.title || taskId} 已提交交付。版本 ${version}。验证：${delivery.verification || '未填写'}。未解决问题：${delivery.open_issues || '无'}。`, false)
+      return delivery
+    })
+  }
+
+  review(
+    parentId: string,
+    workspaceKey: string,
+    actor: string,
+    childId: string,
+    decision: 'accept' | 'reject',
+    comment: string
+  ): Promise<void> {
+    return this.lock(`${workspaceKey}:${parentId}`, async () => {
+      const parent = await this.store.readTaskState(parentId, workspaceKey)
+      this.assertMutable(parent)
+      if (!(parent.child_task_ids ?? []).includes(childId)) throw new Error('这不是当前任务的直接子任务')
+      const child = await this.store.readTaskState(childId, workspaceKey)
+      if (child.parent_task_id !== parentId) throw new Error('子任务的父任务不匹配')
+      if (child.status === 'CANCELLED') throw new Error('子任务已取消，不能验收')
+      const text = comment.trim()
+      if (decision === 'reject' && !text) throw new Error('退回时必须说明问题')
+      if (decision === 'accept' && !child.delivery) throw new Error('子任务还没有提交交付')
+      if (decision === 'accept' && child.delivery) {
+        const dirty = await this.dirtyWorktree(child.work_dir)
+        if (dirty) {
+          throw new Error(`子任务工作区还有未提交的改动，不能验收通过：${dirty.slice(0, 300)}`)
+        }
+        const head = await this.headVersion(child.work_dir)
+        if (head && child.delivery.version && head !== child.delivery.version) {
+          throw new Error(`工作区版本 ${head} 与交付版本 ${child.delivery.version} 不一致，不能沿用这次通过结论`)
+        }
+        const cleaned = await this.hooks.cleanup(childId, workspaceKey)
+        if (!cleaned) throw new Error('子任务后台服务还没清理完，先不要标成已验收')
+      }
+      const acceptance = {
+        decision,
+        comment: text,
+        at: utcNow(),
+        actor,
+        version: child.delivery?.version
+      }
+      await this.store.updateTaskState(childId, workspaceKey, current => ({
+        ...current,
+        status: decision === 'accept' ? 'DONE' : 'READY',
+        acceptance,
+        pending_break: null,
+        break_rejected_by: null,
+        active_run: null,
+        countdown: null,
+        updated_at: utcNow()
+      }))
+      const verb = decision === 'accept' ? '验收通过' : '退回修改'
+      await this.note(childId, workspaceKey, 'derivation.reviewed', `父任务 ${verb}。${text}`, { decision, version: child.delivery?.version ?? '' })
+      await this.note(parentId, workspaceKey, 'derivation.reviewed', `子任务 ${child.title || childId} ${verb}。${text}`, { child_task_id: childId, decision })
+      if (decision === 'reject') {
+        void this.hooks.startTask(childId, workspaceKey).catch(error => {
+          void this.note(childId, workspaceKey, 'derivation.start_failed', `退回后重新启动失败：${error instanceof Error ? error.message : error}`, {})
+        })
+      } else {
+        await this.kickUnblocked(workspaceKey, childId)
+      }
+      this.hooks.terminal(workspaceKey)
+    })
+  }
+
+  /** 父任务写明原因后，已取消的子任务不再挡住父任务结束。未取消的子任务不能这样放过。 */
+  waive(parentId: string, workspaceKey: string, actor: string, childId: string, reason: string): Promise<void> {
+    return this.lock(`${workspaceKey}:${parentId}`, async () => {
+      const parent = await this.store.readTaskState(parentId, workspaceKey)
+      this.assertMutable(parent)
+      if (!(parent.child_task_ids ?? []).includes(childId)) throw new Error('这不是当前任务的直接子任务')
+      const text = reason.trim()
+      if (!text) throw new Error('解除必要性时必须说明原因')
+      const child = await this.store.readTaskState(childId, workspaceKey)
+      if (child.parent_task_id !== parentId) throw new Error('子任务的父任务不匹配')
+      if (child.status !== 'CANCELLED') throw new Error('只有已取消的子任务可以解除必要性。失败的子任务请用 restart；要放弃它，先取消再用 waive')
+      if (child.waiver?.reason) return
+      await this.store.updateTaskState(childId, workspaceKey, current => ({
+        ...current,
+        waiver: { actor, reason: text, at: utcNow() },
+        updated_at: utcNow()
+      }))
+      await this.note(childId, workspaceKey, 'derivation.waived', `父任务解除了这个子任务的必要性：${text}`, { actor })
+      await this.note(parentId, workspaceKey, 'derivation.waived', `已解除子任务 ${child.title || childId} 的必要性：${text}`, { child_task_id: childId })
+    })
+  }
+
+  /** 父任务重新启动失败的直接子任务。已取消的子任务不能被重新拉起。 */
+  restart(parentId: string, workspaceKey: string, actor: string, childId: string): Promise<void> {
+    return this.lock(`${workspaceKey}:${parentId}`, async () => {
+      const parent = await this.store.readTaskState(parentId, workspaceKey)
+      this.assertMutable(parent)
+      if (!(parent.child_task_ids ?? []).includes(childId)) throw new Error('这不是当前任务的直接子任务')
+      const child = await this.store.readTaskState(childId, workspaceKey)
+      if (child.parent_task_id !== parentId) throw new Error('子任务的父任务不匹配')
+      if (child.status === 'CANCELLED') throw new Error('子任务已取消，不能重启')
+      if (child.status !== 'FAILED') throw new Error('只有失败的子任务可以重启')
+      await this.store.updateTaskState(childId, workspaceKey, current => ({
+        ...current,
+        status: 'READY',
+        consecutive_failures: 0,
+        active_run: null,
+        pending_break: null,
+        break_rejected_by: null,
+        countdown: null,
+        pause_cause: null,
+        updated_at: utcNow()
+      }))
+      await this.note(childId, workspaceKey, 'derivation.restarted', `${actor} 重新启动了失败的子任务。`, { actor })
+      await this.note(parentId, workspaceKey, 'derivation.restarted', `重新启动子任务 ${child.title || childId}。`, { child_task_id: childId })
+      void this.hooks.startTask(childId, workspaceKey).catch(error => {
+        void this.note(childId, workspaceKey, 'derivation.start_failed', `重新启动失败：${error instanceof Error ? error.message : error}`, {})
+      })
+      this.hooks.terminal(workspaceKey)
+    })
+  }
+
+  async notifyParent(childId: string, workspaceKey: string, message: string, failure: boolean): Promise<void> {
+    const child = await this.store.readTaskState(childId, workspaceKey)
+    if (!child.parent_task_id) return
+    const parentId = child.parent_task_id
+    const parent = await this.store.readTaskState(parentId, workspaceKey).catch(() => null)
+    if (!parent || parent.status === 'CANCELLED') return
+    await this.note(parentId, workspaceKey, failure ? 'derivation.child_failed' : 'derivation.child_delivered', message, { child_task_id: childId })
+    if (parent.status === 'WAITING_CHILDREN' && parent.pause_cause !== 'user') {
+      await this.store.updateTaskState(parentId, workspaceKey, current => ({
+        ...current,
+        status: 'READY',
+        derivation_hold: null,
+        updated_at: utcNow()
+      }))
+      void this.hooks.startTask(parentId, workspaceKey).catch(() => {})
+      this.hooks.terminal(workspaceKey)
+    }
+  }
+
+  async openRun(taskId: string, workspaceKey: string, actor: string, runId: string): Promise<DerivationSession> {
+    const state = await this.store.readTaskState(taskId, workspaceKey)
+    if (state.status === 'CANCELLED') throw new Error('任务已取消')
+    if (state.active_run?.run_id !== runId) throw new Error('Actor run is no longer active')
+    const token = randomBytes(32).toString('hex')
+    const socketDir = await mkdtemp(join(tmpdir(), 'buddy-derive-'))
+    const socket = join(socketDir, 's')
+    const client = await this.clientFile()
+    let closed = false
+    const server = createServer(async (req, res) => {
+      if (req.headers.authorization !== `Bearer ${token}`) {
+        res.writeHead(401).end(JSON.stringify({ error: 'unauthorized' }))
+        return
+      }
+      const chunks: Buffer[] = []
+      for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+      try {
+        const live = await this.store.readTaskState(taskId, workspaceKey)
+        if (live.status === 'CANCELLED' || live.active_run?.run_id !== runId) {
+          throw new Error('这一轮已经结束或任务已取消，不能再操作派生')
+        }
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') as Record<string, unknown>
+        const value = await this.handle(taskId, workspaceKey, actor, body)
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(value ?? { ok: true }))
+      } catch (error) {
+        res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({
+          error: error instanceof Error ? error.message : String(error)
+        }))
+      }
+    })
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(socket, resolve)
+    })
+    server.unref()
+    return {
+      env: {
+        BUDDY_DERIVATION_SOCKET: socket,
+        BUDDY_DERIVATION_TOKEN: token,
+        BUDDY_DERIVATION_NODE: process.execPath,
+        BUDDY_DERIVATION_CLI: client
+      },
+      close: () => {
+        if (closed) return
+        closed = true
+        server.close(() => { void rm(socketDir, { recursive: true, force: true }) })
+      }
+    }
+  }
+
+  private async handle(taskId: string, workspaceKey: string, actor: string, body: Record<string, unknown>) {
+    const action = body.action
+    if (action === 'status') return this.status(taskId, workspaceKey)
+    if (action === 'propose') return this.propose(taskId, workspaceKey, actor, body.specs)
+    if (action === 'decide') {
+      if (body.decision !== 'agree' && body.decision !== 'disagree') throw new Error('decide 需要 agree 或 disagree')
+      return this.decide(taskId, workspaceKey, actor, body.decision, typeof body.reason === 'string' ? body.reason : '')
+    }
+    if (action === 'create') return this.create(taskId, workspaceKey)
+    if (action === 'wait') return this.wait(taskId, workspaceKey)
+    if (action === 'submit') {
+      return this.submit(taskId, workspaceKey, actor, {
+        version: typeof body.version === 'string' ? body.version : '',
+        artifacts: typeof body.artifacts === 'string' ? body.artifacts : '',
+        verification: typeof body.verification === 'string' ? body.verification : '',
+        open_issues: typeof body.open_issues === 'string' ? body.open_issues : ''
+      })
+    }
+    if (action === 'review') {
+      if (typeof body.child_task_id !== 'string') throw new Error('review 需要子任务 ID')
+      if (body.decision !== 'accept' && body.decision !== 'reject') throw new Error('review 需要 accept 或 reject')
+      await this.review(taskId, workspaceKey, actor, body.child_task_id, body.decision, typeof body.comment === 'string' ? body.comment : '')
+      return { ok: true }
+    }
+    if (action === 'waive' || action === 'restart') {
+      if (typeof body.child_task_id !== 'string') throw new Error(`${action} 需要子任务 ID`)
+      if (action === 'waive') {
+        await this.waive(taskId, workspaceKey, actor, body.child_task_id, typeof body.reason === 'string' ? body.reason : '')
+      } else {
+        await this.restart(taskId, workspaceKey, actor, body.child_task_id)
+      }
+      return { ok: true }
+    }
+    throw new Error('未知的派生操作')
+  }
+
+  private async permissionFor(state: TaskState) {
+    const global = normalizeGlobalSettings(await this.store.readGlobalSettings())
+    return derivationPermission({
+      depth: state.derivation_depth ?? (state.parent_task_id ? 1 : 0),
+      status: state.status,
+      allowNested: global.allow_nested_derivation ?? false
+    })
+  }
+
+  private assertMutable(state: TaskState): void {
+    if (state.status === 'CANCELLED') throw new Error('任务已取消')
+    if (state.status === 'DONE') throw new Error('任务已结束')
+  }
+
+  private async enterWait(taskId: string, workspaceKey: string): Promise<void> {
+    await this.store.updateTaskState(taskId, workspaceKey, current => ({
+      ...current,
+      status: 'WAITING_CHILDREN',
+      derivation_hold: null,
+      active_run: null,
+      countdown: null,
+      updated_at: utcNow()
+    }))
+    await this.note(taskId, workspaceKey, 'derivation.waiting', '父任务开始等待子任务，不再占用执行名额。', {})
+    this.hooks.terminal(workspaceKey)
+  }
+
+  private async kickAll(taskIds: string[], workspaceKey: string): Promise<void> {
+    const runs = taskIds.map(taskId => {
+      let failure: unknown
+      const promise = this.hooks.startTask(taskId, workspaceKey).then(
+        () => undefined,
+        error => { failure = error }
+      )
+      return { taskId, promise, failed: () => failure }
+    })
+    await Promise.all(runs.map(async run => {
+      const deadline = Date.now() + 20000
+      while (Date.now() < deadline) {
+        if (run.failed()) throw run.failed()
+        const state = await this.store.readTaskState(run.taskId, workspaceKey).catch(() => null)
+        if (state && (state.status.startsWith('RUNNING') || state.status === 'PINGING' || state.status === 'FAILED' || state.status === 'PAUSED' || state.status === 'COUNTDOWN')) {
+          return
+        }
+        await delay(15)
+      }
+      throw new Error(`子任务 ${run.taskId} 没有真正启动`)
+    }))
+  }
+
+  private async kickUnblocked(workspaceKey: string, finishedId: string): Promise<void> {
+    const tasks = await this.store.getTasks()
+    const ready: string[] = []
+    for (const task of tasks) {
+      if (task.workspace_key !== workspaceKey) continue
+      const state = await this.store.readTaskState(task.task_id, workspaceKey).catch(() => null)
+      if (!state?.dependency_blocked) continue
+      const deps = state.depends_on_task_ids ?? []
+      if (!deps.includes(finishedId)) continue
+      const statuses = await Promise.all(deps.map(async id => {
+        const dep = await this.store.readTaskState(id, workspaceKey).catch(() => null)
+        return dep?.status
+      }))
+      if (statuses.some(status => status !== 'DONE')) continue
+      await this.store.updateTaskState(task.task_id, workspaceKey, current => ({
+        ...current,
+        dependency_blocked: false,
+        status: current.execution_mode === 'queued' ? 'QUEUED' : 'READY',
+        updated_at: utcNow()
+      }))
+      if ((state.execution_mode ?? 'immediate') !== 'queued') ready.push(task.task_id)
+    }
+    if (ready.length) await this.kickAll(ready, workspaceKey)
+  }
+
+  private async allocateWorkDir(repoRoot: string, workspaceKey: string, taskId: string): Promise<string> {
+    const dir = join(this.store.dataRoot, 'runtime', 'worktrees', workspaceKey, taskId)
+    await mkdir(join(this.store.dataRoot, 'runtime', 'worktrees', workspaceKey), { recursive: true })
+    const git = repoRoot ? await runGit(repoRoot, ['rev-parse', '--is-inside-work-tree']) : { ok: false, stdout: '' }
+    if (git.ok && git.stdout === 'true') {
+      const added = await runGit(repoRoot, ['worktree', 'add', '--detach', dir, 'HEAD'])
+      if (added.ok) return dir
+    }
+    await mkdir(dir, { recursive: true })
+    return dir
+  }
+
+  private async headVersion(workDir?: string): Promise<string | null> {
+    if (!workDir) return null
+    const result = await runGit(workDir, ['rev-parse', 'HEAD'])
+    return result.ok && result.stdout ? result.stdout : null
+  }
+
+  /** 只看子任务自己的工作目录。未跟踪文件也算脏。不是 git 仓库时不拦截。 */
+  private async dirtyWorktree(workDir?: string): Promise<string | null> {
+    if (!workDir) return null
+    const result = await runGit(workDir, ['status', '--porcelain'])
+    if (!result.ok) return null
+    const text = result.stdout.trim()
+    return text || null
+  }
+
+  private async note(taskId: string, workspaceKey: string, type: string, message: string, payload: Record<string, unknown>): Promise<void> {
+    const event = await this.store.appendTaskEvent(taskId, workspaceKey, { type, payload: { message, ...payload } })
+    await this.store.appendTranscript(taskId, workspaceKey, 'system', message, { kind: type })
+    this.hooks.events?.publish({ workspace_key: workspaceKey, task_id: taskId, event })
+  }
+
+  private clientFile(): Promise<string> {
+    if (!this.clientPath) {
+      this.clientPath = (async () => {
+        const digest = createHash('sha256').update(clientSource).digest('hex').slice(0, 16)
+        const path = join(this.store.dataRoot, 'runtime', 'derivation', `client-${digest}.cjs`)
+        await mkdir(join(this.store.dataRoot, 'runtime', 'derivation'), { recursive: true })
+        await writeFile(path, clientSource, { mode: 0o600 })
+        return path
+      })()
+    }
+    return this.clientPath
+  }
+
+  private lock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.tails.get(key) ?? Promise.resolve()
+    const run = previous.then(fn, fn)
+    this.tails.set(key, run.then(() => undefined, () => undefined))
+    return run
+  }
+}

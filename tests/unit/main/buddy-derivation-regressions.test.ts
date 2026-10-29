@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { access, mkdtemp, mkdir, writeFile } from 'node:fs/promises'
+import { access, mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
@@ -44,6 +44,17 @@ async function derive(ctx: Awaited<ReturnType<typeof setup>>, parent: string, sp
   await ctx.service.decide(parent, ctx.ws, 'claude', 'agree', 'agree')
   await ctx.service.decide(parent, ctx.ws, 'codex', 'agree', 'agree')
   return (await ctx.service.create(parent, ctx.ws)).task_ids
+}
+
+async function gitRepo(): Promise<string> {
+  const path = await mkdtemp(join(tmpdir(), 'buddy-derive-repo-'))
+  await git(path, ['init'])
+  await git(path, ['config', 'user.name', 'Review'])
+  await git(path, ['config', 'user.email', 'review@example.invalid'])
+  await writeFile(join(path, 'base.txt'), 'old')
+  await git(path, ['add', '.'])
+  await git(path, ['commit', '-m', 'base'])
+  return path
 }
 
 async function markAwaiting(store: BuddyStore, taskId: string, workspaceKey: string) {
@@ -287,6 +298,143 @@ describe('derivation review regressions', () => {
     expect(root.status).toBe('CANCELLED')
     expect(root.active_run ?? null).toBeNull()
     expect((await cascade.store.readTaskState(nested, cascade.ws)).status).toBe('CANCELLED')
+  })
+
+  it('does not start a child when the parent is paused during creation', async () => {
+    const ctx = await setup()
+    await ctx.runner.startTask('root', { workspace_key: ctx.ws })
+    await ctx.service.propose('root', ctx.ws, 'claude', [spec()])
+    await ctx.service.decide('root', ctx.ws, 'claude', 'agree', 'yes')
+    await ctx.service.decide('root', ctx.ws, 'codex', 'agree', 'yes')
+    const original = ctx.store.createTask.bind(ctx.store)
+    let arrived!: () => void
+    const blocked = new Promise<void>(resolve => { arrived = resolve })
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    ctx.store.createTask = async input => {
+      if (input.parent_task_id === 'root') {
+        arrived()
+        await gate
+      }
+      return original(input)
+    }
+    const creation = ctx.service.create('root', ctx.ws)
+    await blocked
+    await ctx.runner.interrupt('root', ctx.ws)
+    release()
+    await expect(creation).rejects.toThrow(/暂停/)
+    expect((await ctx.store.readTaskState('root', ctx.ws)).status).toBe('PAUSED')
+    const child = (await ctx.store.getTasks()).find(task => task.parent_task_id === 'root')
+    expect(child).toBeTruthy()
+    expect((await ctx.store.readTaskState(child!.task_id, ctx.ws)).status).toBe('CANCELLED')
+  })
+
+  it('keeps an in-flight create valid after the nested switch is turned off', async () => {
+    const ctx = await setup()
+    const [child] = await derive(ctx, 'root')
+    await ctx.service.propose(child, ctx.ws, 'claude', [spec('grand')])
+    await ctx.service.decide(child, ctx.ws, 'claude', 'agree', 'yes')
+    await ctx.service.decide(child, ctx.ws, 'codex', 'agree', 'yes')
+    const original = ctx.store.createTask.bind(ctx.store)
+    let arrived!: () => void
+    const blocked = new Promise<void>(resolve => { arrived = resolve })
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    ctx.store.createTask = async input => {
+      if (input.parent_task_id === child) {
+        arrived()
+        await gate
+      }
+      return original(input)
+    }
+    const creation = ctx.service.create(child, ctx.ws)
+    await blocked
+    await ctx.store.updateGlobalSettings({ ...(await ctx.store.readGlobalSettings()), allow_nested_derivation: false })
+    release()
+    const result = await creation
+    const grand = await ctx.store.readTaskState(result.task_ids[0], ctx.ws)
+    expect(grand.derivation_depth).toBe(2)
+    expect(grand.status.startsWith('RUNNING')).toBe(true)
+  })
+
+  it('does not reject a child that is still running', async () => {
+    const ctx = await setup()
+    const [child] = await derive(ctx, 'root')
+    const before = await ctx.store.readTaskState(child, ctx.ws)
+    const controller = new AbortController()
+    ;(ctx.runner as unknown as { runControllers: Map<string, { runId: string; controller: AbortController }> })
+      .runControllers.set(`${ctx.ws}::${child}`, { runId: before.active_run!.run_id!, controller })
+    await expect(ctx.service.review('root', ctx.ws, 'codex', child, 'reject', 'change the approach')).rejects.toThrow(/内部确认|仍在运行/)
+    const after = await ctx.store.readTaskState(child, ctx.ws)
+    expect(after.active_run?.run_id).toBe(before.active_run?.run_id)
+    expect(after.status.startsWith('RUNNING')).toBe(true)
+    expect(controller.signal.aborted).toBe(false)
+
+    await markAwaiting(ctx.store, child, ctx.ws)
+    await ctx.service.review('root', ctx.ws, 'codex', child, 'reject', 'change the approach')
+    await vi.waitFor(async () => {
+      const restarted = await ctx.store.readTaskState(child, ctx.ws)
+      expect(restarted.status.startsWith('RUNNING')).toBe(true)
+      expect(restarted.active_run?.run_id).not.toBe(before.active_run?.run_id)
+    })
+  })
+
+  it('lets a parent wait while a running child has only submitted a delivery', async () => {
+    const ctx = await setup()
+    const [child] = await derive(ctx, 'root')
+    await ctx.runner.startTask('root', { workspace_key: ctx.ws })
+    await ctx.service.submit(child, ctx.ws, 'claude', { version: 'unversioned', artifacts: 'file', verification: 'ok' })
+    const statuses: string[] = []
+    for (let i = 0; i < 3; i += 1) {
+      if (i > 0) await ctx.runner.startTask('root', { workspace_key: ctx.ws })
+      const current = await ctx.store.readTaskState('root', ctx.ws)
+      await ctx.service.wait('root', ctx.ws)
+      await (ctx.runner as unknown as { completeActor: (...args: unknown[]) => Promise<void> }).completeActor(
+        'root',
+        ctx.ws,
+        current.active_run!.actor,
+        current.active_run!.run_id,
+        '{"type":"chat","content":"wait for child internal review"}',
+        [],
+        1,
+        0
+      )
+      statuses.push((await ctx.store.readTaskState('root', ctx.ws)).status)
+    }
+    expect(statuses).toEqual(['WAITING_CHILDREN', 'WAITING_CHILDREN', 'WAITING_CHILDREN'])
+    expect((await ctx.store.readTaskState(child, ctx.ws)).status.startsWith('RUNNING')).toBe(true)
+  })
+
+  it('refuses to derive from a dirty parent worktree', async () => {
+    const path = await gitRepo()
+    await writeFile(join(path, 'base.txt'), 'needed working change')
+    await writeFile(join(path, 'new-file.txt'), 'uncommitted input')
+    const ctx = await setup(path)
+    await expect(derive(ctx, 'root')).rejects.toThrow(/未提交/)
+    expect((await ctx.store.getTasks()).some(task => task.parent_task_id === 'root')).toBe(false)
+    expect(await readFile(join(path, 'base.txt'), 'utf8')).toBe('needed working change')
+  })
+
+  it('retries creation after a worktree was left behind by a failed persist', async () => {
+    const ctx = await setup(await gitRepo())
+    await ctx.service.propose('root', ctx.ws, 'claude', [spec()])
+    await ctx.service.decide('root', ctx.ws, 'claude', 'agree', 'yes')
+    await ctx.service.decide('root', ctx.ws, 'codex', 'agree', 'yes')
+    const original = ctx.store.createTask.bind(ctx.store)
+    let fail = true
+    ctx.store.createTask = async input => {
+      if (input.parent_task_id && fail) {
+        fail = false
+        throw new Error('simulated interrupted task persistence')
+      }
+      return original(input)
+    }
+    await expect(ctx.service.create('root', ctx.ws)).rejects.toThrow(/interrupted/)
+    const created = await ctx.service.create('root', ctx.ws)
+    expect(created.task_ids).toHaveLength(1)
+    const child = await ctx.store.readTaskState(created.task_ids[0], ctx.ws)
+    expect(await readFile(join(child.work_dir!, 'base.txt'), 'utf8')).toBe('old')
+    expect((await ctx.store.getTasks()).filter(task => task.parent_task_id === 'root')).toHaveLength(1)
   })
 
   it('keeps sidebar children inside their own project', () => {

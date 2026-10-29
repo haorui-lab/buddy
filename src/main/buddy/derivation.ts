@@ -111,20 +111,9 @@ export function blocksParentCompletion(child: { status: TaskStatus; waived?: boo
   return true
 }
 
-/** 子任务已经交出结果，父任务不该再停在等待里。已验收通过的不算。 */
-export function childResultNeedsParent(child: {
-  status: TaskStatus
-  delivery?: { version?: string; submitted_at?: string } | null
-  acceptance?: { at?: string } | null
-}): boolean {
-  if (child.status === 'DONE') return false
-  if (child.status === 'AWAITING_ACCEPTANCE' || child.status === 'FAILED' || child.status === 'CANCELLED') return true
-  const version = child.delivery?.version
-  if (!version) return false
-  if (!child.acceptance) return true
-  const submittedAt = child.delivery?.submitted_at
-  if (!submittedAt || !child.acceptance.at) return false
-  return submittedAt > child.acceptance.at
+/** 父任务必须亲自处理的结果。交付了但子任务还在跑，只是内部确认还没结束，不算。 */
+export function childResultNeedsParent(child: { status: TaskStatus }): boolean {
+  return child.status === 'AWAITING_ACCEPTANCE' || child.status === 'FAILED' || child.status === 'CANCELLED'
 }
 
 /** 必要子任务未验收通过时，父任务不能结束。子任务要先提交交付，双方确认后才进入待验收。 */
@@ -490,6 +479,8 @@ export class DerivationService {
       if (proposal.status === 'created' && proposal.created_task_ids.length > 0) {
         return { task_ids: proposal.created_task_ids, reused: true }
       }
+      // 这一次创建在开始时已经通过权限复核，中途关掉嵌套开关不打断它。
+      // 开关只拦住下一次创建请求。暂停、取消、结束会在下面的检查点停掉本次创建。
       const permission = await this.permissionFor(state)
       if (!permission.allowed) throw new Error(`创建前复核未通过：${permission.reason}`)
       const actors = actorsOf(settings)
@@ -497,15 +488,22 @@ export class DerivationService {
       const idByKey = new Map(proposal.specs.map(spec => [spec.key, derivedTaskId(taskId, spec.key)]))
       const created: string[] = []
       const fresh: string[] = []
-      const parentClosed = async () => {
+      const parentStopped = async (): Promise<string | null> => {
         const live = await this.store.readTaskState(taskId, workspaceKey)
-        return live.status === 'CANCELLED' || live.status === 'DONE'
+        if (live.status === 'CANCELLED') return '父任务已取消，不再创建或启动子任务'
+        if (live.status === 'DONE' || live.status === 'AWAITING_ACCEPTANCE') return '父任务已结束，不再创建或启动子任务'
+        if (live.status === 'PAUSED') return '父任务已暂停，不再创建或启动子任务'
+        if (live.status === 'FAILED') return '父任务已失败，不再创建或启动子任务'
+        return null
+      }
+      const stopIfParentClosed = async (): Promise<void> => {
+        const reason = await parentStopped()
+        if (!reason) return
+        await this.cancelFreshChildren(fresh, workspaceKey)
+        throw new Error(reason)
       }
       for (const spec of proposal.specs) {
-        if (await parentClosed()) {
-          await this.cancelFreshChildren(fresh, workspaceKey)
-          throw new Error('父任务已取消，不再创建或启动子任务')
-        }
+        await stopIfParentClosed()
         const childId = idByKey.get(spec.key)!
         const dependsOn = spec.dependencies.map(key => idByKey.get(key)!).filter(Boolean)
         const existing = await this.store.readTaskState(childId, workspaceKey).catch(() => null)
@@ -521,10 +519,7 @@ export class DerivationService {
           continue
         }
         const workDir = await this.allocateWorkDir(state, workspaceKey, childId)
-        if (await parentClosed()) {
-          await this.cancelFreshChildren(fresh, workspaceKey)
-          throw new Error('父任务已取消，不再创建或启动子任务')
-        }
+        await stopIfParentClosed()
         await this.store.createTask({
           task_id: childId,
           repo_root: state.repo_root,
@@ -544,15 +539,9 @@ export class DerivationService {
         })
         fresh.push(childId)
         created.push(childId)
-        if (await parentClosed()) {
-          await this.cancelFreshChildren(fresh, workspaceKey)
-          throw new Error('父任务已取消，不再创建或启动子任务')
-        }
+        await stopIfParentClosed()
       }
-      if (await parentClosed()) {
-        await this.cancelFreshChildren(fresh, workspaceKey)
-        throw new Error('父任务已取消，不再创建或启动子任务')
-      }
+      await stopIfParentClosed()
       const saved: DerivationProposal = { ...proposal, status: 'created', created_task_ids: created }
       await this.store.updateTaskState(taskId, workspaceKey, current => ({
         ...current,
@@ -568,6 +557,7 @@ export class DerivationService {
           ready.push(childId)
         }
       }
+      await stopIfParentClosed()
       if ((state.execution_mode ?? 'immediate') === 'queued') {
         this.hooks.terminal(workspaceKey)
       } else {
@@ -642,6 +632,10 @@ export class DerivationService {
       if (child.status === 'CANCELLED') throw new Error('子任务已取消，不能验收')
       const text = comment.trim()
       if (decision === 'reject' && !text) throw new Error('退回时必须说明问题')
+      if (decision === 'reject') {
+        if (child.status !== 'AWAITING_ACCEPTANCE') throw new Error('子任务还没有完成内部确认，不能退回')
+        if (child.active_run) throw new Error('子任务仍在运行，不能退回')
+      }
       if (decision === 'accept') {
         if (child.status !== 'AWAITING_ACCEPTANCE') throw new Error('子任务还没有完成内部确认，不能验收')
         if (child.active_run) throw new Error('子任务仍在运行，不能验收')
@@ -669,10 +663,11 @@ export class DerivationService {
         version: child.delivery?.version
       }
       await this.store.updateTaskState(childId, workspaceKey, current => {
-        if (decision === 'accept') {
-          if (current.status !== 'AWAITING_ACCEPTANCE' || current.active_run || !current.delivery) {
-            throw new Error('子任务状态已经变化，不能验收')
-          }
+        if (decision === 'accept' && (current.status !== 'AWAITING_ACCEPTANCE' || current.active_run || !current.delivery)) {
+          throw new Error('子任务状态已经变化，不能验收')
+        }
+        if (decision === 'reject' && (current.status !== 'AWAITING_ACCEPTANCE' || current.active_run)) {
+          throw new Error('子任务状态已经变化，不能退回')
         }
         return {
           ...current,
@@ -759,6 +754,7 @@ export class DerivationService {
       const parent = await this.store.readTaskState(parentId, workspaceKey).catch(() => null)
       if (!parent || parent.status === 'CANCELLED' || parent.status === 'DONE') return
       await this.note(parentId, workspaceKey, failure ? 'derivation.child_failed' : 'derivation.child_delivered', message, { child_task_id: childId })
+      if (!childResultNeedsParent(child)) return
       if (parent.pause_cause === 'user') return
       if (parent.status === 'WAITING_CHILDREN') {
         await this.store.updateTaskState(parentId, workspaceKey, current => ({
@@ -998,7 +994,19 @@ export class DerivationService {
     await mkdir(join(this.store.dataRoot, 'runtime', 'worktrees', workspaceKey), { recursive: true })
     const base = await this.gitWorkBase(parent.work_dir) ?? await this.gitWorkBase(parent.repo_root)
     if (base) {
-      const added = await runGit(base, ['worktree', 'add', '--detach', dir, 'HEAD'])
+      const dirty = await this.dirtyWorktree(base)
+      if (dirty) {
+        throw new Error(`父任务工作区还有未提交的改动，不能从这里派生：${dirty.slice(0, 300)}`)
+      }
+      let added = await runGit(base, ['worktree', 'add', '--detach', dir, 'HEAD'])
+      const occupied = `${added.stderr}\n${added.stdout}`
+      if (!added.ok && /already exists|already used|file exists/i.test(occupied)) {
+        const recorded = await this.store.readTaskState(taskId, workspaceKey).catch(() => null)
+        if (!recorded) {
+          await runGit(base, ['worktree', 'remove', '--force', dir])
+          added = await runGit(base, ['worktree', 'add', '--detach', dir, 'HEAD'])
+        }
+      }
       if (!added.ok) {
         throw new Error(`无法从父任务工作版本创建工作目录：${added.stderr || added.stdout || 'git worktree add 失败'}`)
       }

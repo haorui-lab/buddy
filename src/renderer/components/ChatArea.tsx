@@ -188,7 +188,7 @@ export function ChatArea({ task, hasAnyTasks, onSendMessage, onStartTask, onInte
     setShowScrollBtn(false)
   }, [task?.task_id])
 
-  const timeline = useMemo(() => task ? derivationTimeline(task.transcript, task.state) : [], [task?.transcript, task?.state.status, task?.state.active_run])
+  const timeline = useMemo(() => task ? derivationTimeline(task.transcript, task.state, task.events) : [], [task?.transcript, task?.state.status, task?.state.active_run, task?.events])
   const isReady = isTaskReadyToStart(task?.state)
   const hasTranscript = (task?.transcript?.length ?? 0) > 0
   const taskText = (task?.task_text || '').trim()

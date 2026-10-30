@@ -110,6 +110,7 @@ const EVENT_TYPE_KEY: Record<string, TranslationKey> = {
   'derivation.restarted': 'derivation.event.restarted',
   'derivation.waiting': 'derivation.event.waiting',
   'derivation.child_failed': 'derivation.event.child_failed',
+  'derivation.child_submitted': 'derivation.event.child_submitted',
   'derivation.child_delivered': 'derivation.event.child_delivered',
   'derivation.start_failed': 'derivation.event.start_failed',
   'task.completion_blocked': 'derivation.event.completion_blocked',
@@ -128,8 +129,47 @@ export function isHiddenEvent(type: string | undefined): boolean {
   return !!type && HIDDEN_EVENT_TYPES.has(type)
 }
 
-export function eventTypeLabel(type: string, lang: Language): string {
-  const key = EVENT_TYPE_KEY[type]
+/** Older records used child_delivered for both submission and completed internal review. */
+export function derivationEventType(type: string, message: unknown): string {
+  return type === 'derivation.child_delivered' && typeof message === 'string'
+    && /^子任务 .+ 已(?:重新)?提交交付。版本 /.test(message)
+    ? 'derivation.child_submitted' : type
+}
+
+/** Enrich old notices using only the preceding events, never the child's current state. */
+export function derivationEventDetails(events: Event[]): Map<number, Record<string, unknown>> {
+  const history = new Map<string, { revision: number; version: string | null }>()
+  const details = new Map<number, Record<string, unknown>>()
+  for (const event of events) {
+    const payload = event.payload
+    const kind = derivationEventType(event.type, payload.message)
+    const childId = typeof payload.child_task_id === 'string' ? payload.child_task_id : null
+    let context = childId ? history.get(childId) : undefined
+    if (childId && kind === 'derivation.child_submitted') {
+      const version = typeof payload.version === 'string' ? payload.version
+        : typeof payload.message === 'string' ? payload.message.match(/提交交付。版本 ([^。]+)。/)?.[1] ?? null : null
+      context = { revision: typeof payload.delivery_revision === 'number' ? payload.delivery_revision : (context?.revision ?? 0) + 1, version }
+      history.set(childId, context)
+    }
+    details.set(event.seq, {
+      ...(context ? { delivery_revision: context.revision, version: context.version } : {}),
+      ...payload,
+      ...(payload.child_status === undefined && kind === 'derivation.child_delivered' ? { child_status: 'AWAITING_ACCEPTANCE' } : {}),
+      ...(payload.child_status === undefined && kind === 'derivation.child_failed'
+        ? { child_status: String(payload.message).includes('已取消') ? 'CANCELLED' : 'FAILED' } : {})
+    })
+  }
+  return details
+}
+
+export function eventTypeLabel(type: string, lang: Language, message?: unknown): string {
+  const payload = message && typeof message === 'object' ? message as Record<string, unknown> : undefined
+  const kind = derivationEventType(type, payload?.message ?? message)
+  if (typeof payload?.delivery_revision === 'number' && payload.delivery_revision > 1) {
+    if (kind === 'derivation.child_submitted') return translate(lang, 'derivation.event.child_resubmitted')
+    if (kind === 'derivation.child_delivered') return translate(lang, 'derivation.event.child_redelivered')
+  }
+  const key = EVENT_TYPE_KEY[kind]
   return key ? translate(lang, key) : type
 }
 

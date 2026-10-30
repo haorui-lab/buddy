@@ -18,6 +18,81 @@ const child = { task_id: 'child-1', workspace_key: 'ws', parent_task_id: 'parent
 const notice = (kind: string, content: string): TranscriptEntry => ({ role: 'system', ts: '2026-10-29T11:10:00Z', content, meta: { kind: `derivation.${kind}` } })
 
 describe('derivation notices', () => {
+  it('infers repeat delivery and its version for old records of the same child', () => {
+    const submitted = '子任务 工具 已提交交付。版本 abc123。验证：ok。'
+    const ready = '子任务 工具 已完成内部确认，等待验收。'
+    const entries = [submitted, ready, submitted, ready].map((content, index) => ({
+      ...notice('child_delivered', content), ts: `2026-10-29T11:10:0${index}Z`
+    }))
+    const events = entries.map((entry, index) => ({
+      seq: index + 1, type: 'derivation.child_delivered', ts: entry.ts,
+      payload: { child_task_id: child.task_id, message: entry.content }
+    })) as Event[]
+    render(<DerivationNotice entries={entries} events={events} tasks={[child]} workspaceKey="ws" />)
+    expect(screen.getByText('子任务已提交产物，内部审查中。')).toBeVisible()
+    expect(screen.getByText('子任务审查通过，等待父任务验收。')).toBeVisible()
+    expect(screen.getByText('子任务已重新提交产物（第 2 次交付），内部审查中。')).toBeVisible()
+    expect(screen.getByText('重新提交的第 2 次交付已审查通过，等待父任务验收。')).toBeVisible()
+    expect(screen.getAllByText('版本 abc123')).toHaveLength(4)
+    expect(events[2].payload).not.toHaveProperty('delivery_revision')
+  })
+
+  it('renders persisted resubmission and status metadata even without event history', () => {
+    const entries = [
+      { ...notice('child_submitted', '重新交付'), meta: { kind: 'derivation.child_submitted', delivery_revision: 3, version: 'full-version-hash', child_task_id: child.task_id } },
+      { ...notice('child_status_refreshed', '结束时复核'), meta: { kind: 'derivation.child_status_refreshed', child_status: 'AWAITING_ACCEPTANCE', version: 'full-version-hash', child_task_id: child.task_id } }
+    ]
+    render(<DerivationNotice entries={entries} events={[]} tasks={[child]} workspaceKey="ws" />)
+    expect(screen.getByText('子任务已重新提交产物（第 3 次交付），内部审查中。')).toBeVisible()
+    expect(screen.getByText('本轮结束时复核：子任务状态为“待验收”。若上方结论不同，请以此为准。')).toBeVisible()
+    expect(screen.getAllByTitle('full-version-hash')).toHaveLength(2)
+  })
+
+  it.each(['child_submitted', 'child_delivered'])('distinguishes %s submission from readiness, including historical records', kind => {
+    const submitted = '子任务 修复派生缺陷 已提交交付。版本 1。验证：测试通过。未解决问题：无。'
+    const ready = '子任务 修复派生缺陷 已完成内部确认，等待验收。'
+    const entries = [notice(kind, submitted), notice('child_delivered', ready)]
+    const events = entries.map((entry, index) => ({
+      seq: index + 1, type: entry.meta!.kind, ts: entry.ts,
+      payload: { message: entry.content, child_task_id: child.task_id }
+    })) as Event[]
+    const select = vi.fn()
+    render(<DerivationNotice entries={entries} events={events} tasks={[child]} workspaceKey="ws" onSelectTask={select} />)
+    expect(screen.getByText('子任务已提交产物，内部审查中。')).toBeVisible()
+    expect(screen.getByText('子任务审查通过，等待父任务验收。')).toBeVisible()
+    fireEvent.click(screen.getAllByRole('button', { name: child.title })[0])
+    expect(select).toHaveBeenCalledWith('child-1', 'ws')
+    fireEvent.click(screen.getByText('派生详情'))
+    expect(screen.getByText(submitted)).toBeVisible()
+    expect(screen.getByText(ready)).toBeVisible()
+  })
+
+  it('recognizes a historical submission even when its event payload is unavailable', () => {
+    render(<DerivationNotice entries={[notice('child_delivered', '子任务 工具 已提交交付。版本 v1。验证：ok。')]} events={[]} tasks={[]} workspaceKey="ws" />)
+    expect(screen.getByText('子任务已提交产物，内部审查中。')).toBeVisible()
+    expect(screen.queryByText('子任务审查通过，等待父任务验收。')).not.toBeInTheDocument()
+  })
+
+  it('does not classify quoted submission text in a ready notice as a new submission', () => {
+    render(<DerivationNotice entries={[notice('child_delivered', '子任务 工具 已完成内部确认，等待验收。备注：已提交交付。版本 v1。')]} events={[]} tasks={[]} workspaceKey="ws" />)
+    expect(screen.getByText('子任务审查通过，等待父任务验收。')).toBeVisible()
+  })
+
+  it('labels the submitting actor as awaiting internal review rather than parent acceptance', () => {
+    render(<DerivationNotice entries={[notice('submitted', 'wecode_claude 提交了交付，版本 v1。')]} events={[]} tasks={[]} workspaceKey="ws" />)
+    expect(screen.getByText('WeCode Claude 已提交产物，内部审查中。')).toBeVisible()
+  })
+
+  it('distinguishes delivery stages in localized process events', () => {
+    expect(eventTypeLabel('derivation.child_submitted', 'zh-CN')).toBe('子任务已提交产物')
+    expect(eventTypeLabel('derivation.child_submitted', 'zh-TW')).toBe('子任務已提交產物')
+    expect(eventTypeLabel('derivation.child_submitted', 'en')).toBe('Subtask submitted')
+    expect(eventTypeLabel('derivation.child_delivered', 'zh-CN', '子任务 工具 已提交交付。版本 v1。')).toBe('子任务已提交产物')
+    expect(eventTypeLabel('derivation.child_delivered', 'zh-CN')).toBe('子任务待验收')
+    expect(eventTypeLabel('derivation.child_submitted', 'zh-CN', { delivery_revision: 2 })).toBe('子任务已重新提交')
+    expect(eventTypeLabel('derivation.child_delivered', 'zh-CN', { delivery_revision: 2 })).toBe('重交产物待验收')
+  })
+
   it('uses existing system notice styling, display names and collapsed full reasons', () => {
     const original = 'wecode_claude 同意派生方案。核实了所有状态写入路径。'
     const { container } = render(<DerivationNotice entries={[notice('decided', original)]} events={[]} tasks={[]} workspaceKey="ws" />)

@@ -1,3 +1,4 @@
+import { execFile } from 'node:child_process'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -30,6 +31,185 @@ function raceUpdate(store: BuddyStore, task: string, transition: Partial<TaskSta
 }
 
 describe('derivation reliability and stop conditions', () => {
+  it('records the actual child status when results arrive during a stale actor conclusion', async () => {
+    const c = await setup()
+    await c.runner.startTask('parent', { workspace_key: c.ws, actor: 'claude' })
+    const before = await c.store.readTaskState('parent', c.ws)
+    await c.store.updateTaskState('child', c.ws, s => ({ ...s, status: 'AWAITING_ACCEPTANCE', delivery }))
+    await c.service.notifyParent('child', c.ws, '已完成内部确认，等待验收。', false)
+    await (c.runner as any).completeActor('parent', c.ws, 'claude', before.active_run!.run_id,
+      '{"type":"chat","content":"子任务还在运行，不能验收。"}', [], 1, 0)
+    const detail = await c.store.getTaskDetail('parent', c.ws)
+    const actor = detail.transcript.find(e => e.role === 'claude')!
+    expect(actor.content).toBe('子任务还在运行，不能验收。')
+    expect(actor.meta?.child_updates).toEqual([expect.objectContaining({
+      child_task_id: 'child', child_status: 'AWAITING_ACCEPTANCE', version: 'v1', delivery_revision: 1
+    })])
+  })
+
+  it('does not add a status refresh for results that arrived before the actor started', async () => {
+    const c = await setup()
+    await c.store.updateTaskState('child', c.ws, s => ({ ...s, status: 'AWAITING_ACCEPTANCE', delivery }))
+    await c.service.notifyParent('child', c.ws, '已完成内部确认，等待验收。', false)
+    await c.runner.startTask('parent', { workspace_key: c.ws, actor: 'claude' })
+    const before = await c.store.readTaskState('parent', c.ws)
+    await (c.runner as any).completeActor('parent', c.ws, 'claude', before.active_run!.run_id,
+      '{"type":"chat","content":"已看到交付。"}', [], 1, 0)
+    const detail = await c.store.getTaskDetail('parent', c.ws)
+    expect(detail.transcript.find(e => e.role === 'claude')?.meta?.child_updates).toBeUndefined()
+  })
+
+  it('notifies submission separately and wakes the parent only after internal confirmation', async () => {
+    const c = await setup()
+    await c.store.updateTaskState('parent', c.ws, s => ({ ...s, status: 'WAITING_CHILDREN' }))
+    await c.runner.startTask('child', { workspace_key: c.ws, actor: 'claude' })
+    await c.service.submit('child', c.ws, 'claude', { version: 'v1', artifacts: 'file', verification: 'ok' })
+    let parent = await c.store.getTaskDetail('parent', c.ws)
+    expect(parent.state.status).toBe('WAITING_CHILDREN')
+    expect(parent.events.filter(e => e.type.startsWith('derivation.child_')).map(e => e.type)).toEqual(['derivation.child_submitted'])
+    expect(parent.transcript.some(e => e.meta?.kind === 'derivation.child_submitted')).toBe(true)
+    for (const actor of ['claude', 'codex']) {
+      if (actor === 'codex') await c.runner.startTask('child', { workspace_key: c.ws, actor })
+      const child = await c.store.readTaskState('child', c.ws)
+      await (c.runner as any).completeActor('child', c.ws, actor, child.active_run!.run_id,
+        '{"type":"break","content":"完成内部确认。"}', [], 1, 0)
+    }
+    await vi.waitFor(async () => {
+      expect((await c.store.readTaskState('parent', c.ws)).status.startsWith('RUNNING')).toBe(true)
+    })
+    parent = await c.store.getTaskDetail('parent', c.ws)
+    const notices = parent.events.filter(e => e.type.startsWith('derivation.child_'))
+    expect(notices.map(e => e.type)).toEqual(['derivation.child_submitted', 'derivation.child_delivered'])
+    expect(notices.every(e => e.payload.child_task_id === 'child')).toBe(true)
+    expect((await c.store.readTaskState('child', c.ws)).status).toBe('AWAITING_ACCEPTANCE')
+  })
+
+  it('tells an active actor to finish its turn after wait instead of polling', async () => {
+    const c = await setup()
+    await c.runner.startTask('parent', { workspace_key: c.ws, actor: 'claude' })
+    const before = await c.store.readTaskState('parent', c.ws)
+    const result = await c.service.wait('parent', c.ws)
+    expect(result).toMatchObject({ waiting: false, deferred: true, next_action: 'finish_turn' })
+    expect(result).toHaveProperty('message', expect.stringContaining('立即结束本轮'))
+    expect(result).toHaveProperty('message', expect.stringContaining('不要 sleep'))
+    const after = await c.store.readTaskState('parent', c.ws)
+    expect(after.active_run).toEqual(before.active_run)
+    expect(after.derivation_hold).toBe('children')
+    expect(await c.service.status('parent', c.ws)).toMatchObject({ next_action: 'finish_turn', message: result.message })
+  })
+
+  it('exposes wait instructions and child details through the actual derivation CLI', async () => {
+    const c = await setup()
+    await c.runner.startTask('parent', { workspace_key: c.ws, actor: 'claude' })
+    const parent = await c.store.readTaskState('parent', c.ws)
+    const session = await c.service.openRun('parent', c.ws, 'claude', parent.active_run!.run_id)
+    const command = (action: string) => new Promise<unknown>((resolve, reject) => {
+      execFile(process.execPath, [session.env.BUDDY_DERIVATION_CLI, action], {
+        env: { ...process.env, ...session.env }
+      }, (error, stdout) => {
+        if (error) reject(error)
+        else {
+          try { resolve(JSON.parse(stdout)) } catch (parseError) { reject(parseError) }
+        }
+      })
+    })
+    try {
+      expect(await command('wait')).toMatchObject({
+        deferred: true, next_action: 'finish_turn', message: expect.stringContaining('立即结束本轮')
+      })
+      await c.store.updateTaskState('child', c.ws, s => ({
+        ...s, status: 'AWAITING_ACCEPTANCE', work_dir: join(c.dir, 'child-worktree'), delivery
+      }))
+      expect(await command('status')).toMatchObject({
+        task_id: 'parent', delivery: null, children: ['child'], next_action: 'finish_turn',
+        child_details: [{ task_id: 'child', status: 'AWAITING_ACCEPTANCE', work_dir: join(c.dir, 'child-worktree'), delivery }]
+      })
+    } finally {
+      session.close()
+    }
+  })
+
+  it('distinguishes an entered wait from an immediately actionable child result', async () => {
+    const c = await setup()
+    expect(await c.service.wait('parent', c.ws)).toMatchObject({
+      waiting: true, deferred: false, next_action: 'wait_for_children'
+    })
+    await c.store.updateTaskState('child', c.ws, s => ({ ...s, status: 'AWAITING_ACCEPTANCE', delivery }))
+    expect(await c.service.wait('parent', c.ws)).toMatchObject({
+      waiting: false, deferred: false, next_action: 'continue'
+    })
+    await vi.waitFor(async () => {
+      expect((await c.store.readTaskState('parent', c.ws)).status.startsWith('RUNNING')).toBe(true)
+    })
+  })
+
+  it('returns child delivery and work directory separately from the parent fields', async () => {
+    const c = await setup()
+    const work_dir = join(c.dir, 'child-worktree')
+    await c.store.updateTaskState('child', c.ws, s => ({
+      ...s, status: 'AWAITING_ACCEPTANCE', work_dir, delivery
+    }))
+    expect(await c.service.status('parent', c.ws)).toMatchObject({
+      task_id: 'parent', status: 'READY', children: ['child'], delivery: null, acceptance: null,
+      child_details: [{ task_id: 'child', status: 'AWAITING_ACCEPTANCE', work_dir, delivery, acceptance: null }]
+    })
+    const section = await c.service.promptSection('parent', c.ws)
+    expect(section).toContain(work_dir)
+    expect(section).toContain('交付版本 v1')
+  })
+
+  it.each(['missing', 'corrupt'])('reports a %s child as unreadable in status', async kind => {
+    const c = await setup()
+    if (kind === 'missing') await rm(c.store.statePath('child', c.ws))
+    else await writeFile(c.store.statePath('child', c.ws), '{broken')
+    expect(await c.service.status('parent', c.ws)).toMatchObject({
+      children: ['child'], child_details: [{ task_id: 'child', status: null, unreadable: true }]
+    })
+  })
+
+  it('keeps wait and status instructions even with a saved custom derivation prompt', async () => {
+    const c = await setup()
+    await c.store.updateGlobalSettings({ ...(await c.store.readGlobalSettings()), derivation_prompt: '按需派生。' })
+    const section = await c.service.promptSection('parent', c.ws)
+    expect(section.startsWith('按需派生。')).toBe(true)
+    expect(section).toContain('立即结束本轮')
+    expect(section).toContain('不要 sleep')
+    expect(section).toContain('child_details')
+    expect(section).toContain('work_dir')
+    expect(section).toContain('type=chat')
+  })
+
+  it.each(['before', 'after'])('continues acceptance when a child arrives %s the waiting turn ends', async timing => {
+    const c = await setup()
+    await c.runner.startTask('parent', { workspace_key: c.ws, actor: 'claude' })
+    const parent = await c.store.readTaskState('parent', c.ws)
+    await c.service.wait('parent', c.ws)
+    const deliver = async () => {
+      await c.store.updateTaskState('child', c.ws, s => ({ ...s, status: 'AWAITING_ACCEPTANCE', delivery }))
+      await c.service.notifyParent('child', c.ws, '交付待验收', false)
+    }
+    if (timing === 'before') await deliver()
+    await (c.runner as any).completeActor('parent', c.ws, 'claude', parent.active_run!.run_id,
+      '{"type":"chat","content":"等待子任务，交还控制权。"}', [], 1, 0)
+    if (timing === 'after') {
+      expect((await c.store.readTaskState('parent', c.ws)).status).toBe('WAITING_CHILDREN')
+      await deliver()
+      await vi.waitFor(async () => {
+        expect((await c.store.readTaskState('parent', c.ws)).status.startsWith('RUNNING')).toBe(true)
+      })
+    } else {
+      expect((await c.store.readTaskState('parent', c.ws)).status).toBe('READY')
+      await c.runner.startTask('parent', { workspace_key: c.ws })
+    }
+    const after = await c.store.readTaskState('parent', c.ws)
+    expect(after.derivation_hold ?? null).toBeNull()
+    expect(after.derivation_wake_pending ?? null).toBeNull()
+    expect(after.active_run?.actor).toBe('codex')
+    expect(await c.service.status('parent', c.ws)).toMatchObject({
+      child_details: [{ task_id: 'child', status: 'AWAITING_ACCEPTANCE', delivery }]
+    })
+  })
+
   it.each(['DONE', 'CANCELLED', 'PAUSED'] as const)('wait preserves concurrent %s and its active run', async status => {
     const c = await setup()
     const active_run = { actor: 'claude', run_id: 'still-live', started_at: new Date().toISOString() }

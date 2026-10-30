@@ -10,8 +10,8 @@ import { BuddyStore } from '../../../src/main/buddy/store'
 import type { DerivationSpec } from '../../../src/shared/types'
 
 const specs: DerivationSpec[] = [
-  { key: 'alpha', title: '甲', goal: '做甲', scope: '甲的范围', context: '甲的上下文', dependencies: [], deliverables: '甲的产物', acceptance: '甲通过测试' },
-  { key: 'beta', title: '乙', goal: '做乙', scope: '乙的范围', context: '乙的上下文', dependencies: [], deliverables: '乙的产物', acceptance: '乙通过测试' }
+  { key: 'alpha', title: '甲', goal: '做甲', scope: '甲的范围', context: '甲的上下文', dependencies: [], deliverables: '甲的产物', acceptance: '甲通过测试', workspace_mode: 'isolated' },
+  { key: 'beta', title: '乙', goal: '做乙', scope: '乙的范围', context: '乙的上下文', dependencies: [], deliverables: '乙的产物', acceptance: '乙通过测试', workspace_mode: 'isolated' }
 ]
 
 function git(cwd: string, args: string[]): Promise<string> {
@@ -164,7 +164,12 @@ describe('task derivation', () => {
     const { task_ids } = await service.create('root-task', ws)
     const child = await store.readTaskState(task_ids[0], ws)
     const head = await git(child.work_dir!, ['rev-parse', 'HEAD'])
-    await service.submit(task_ids[0], ws, 'claude', { version: 'not-the-head', artifacts: 'readme.txt', verification: '未跑', open_issues: '' })
+    await expect(service.submit(task_ids[0], ws, 'claude', { version: 'not-the-head', artifacts: 'readme.txt', verification: '未跑', open_issues: '' })).rejects.toThrow(/不一致/)
+    // Legacy delivery records still need the final acceptance guard.
+    await store.updateTaskState(task_ids[0], ws, state => ({ ...state, delivery: {
+      version: 'not-the-head', artifacts: 'readme.txt', verification: '未跑', open_issues: '',
+      submitted_at: new Date().toISOString(), submitted_by: 'claude'
+    } }))
     await markAwaiting(store, task_ids[0], ws)
     await expect(service.review('root-task', ws, 'codex', task_ids[0], 'accept', '看起来行')).rejects.toThrow(/不一致/)
     await service.submit(task_ids[0], ws, 'claude', { version: head, artifacts: 'readme.txt', verification: 'git status 干净', open_issues: '无' })

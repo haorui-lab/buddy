@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { createServer } from 'node:http'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import clientSource from './derivation-client.cjs?raw'
@@ -20,6 +20,26 @@ import type { BuddyEventBus } from './events'
 import type { BuddyStore } from './store'
 
 const KEY_PATTERN = /^[a-zA-Z0-9._-]{1,40}$/
+const FINISH_WAIT_TURN = '等待请求已登记。立即结束本轮，输出最终 type=chat 回复，把控制权交还 Buddy；不要 sleep、轮询或继续执行工具，也不要用 type=break 结束任务。Buddy 会在子任务需要验收或处理时启动后续回合。'
+
+interface DerivationChildDetail {
+  task_id: string
+  title: string
+  status: TaskStatus | null
+  work_dir: string | null
+  workspace_mode: 'shared' | 'isolated'
+  delivery: TaskDelivery | null
+  acceptance: NonNullable<TaskState['acceptance']> | null
+  waived: boolean
+  unreadable?: boolean
+}
+
+interface DerivationWaitResult {
+  waiting: boolean
+  deferred: boolean
+  next_action: 'finish_turn' | 'wait_for_children' | 'continue'
+  message: string
+}
 
 export interface ChildSnapshot {
   task_id: string
@@ -147,14 +167,16 @@ export function formatDerivationSection(input: {
   children: Array<{
     task_id: string
     title?: string
-    status: string
+    status: string | null
     unreadable?: boolean
-    work_dir?: string
+    work_dir?: string | null
+    workspace_mode?: 'shared' | 'isolated'
     delivery?: TaskState['delivery']
     acceptance?: TaskState['acceptance']
     waived?: boolean
   }>
   workDir?: string
+  workspaceMode?: 'shared' | 'isolated'
   session?: Record<string, string>
   specFile: string
 }): string {
@@ -163,6 +185,7 @@ export function formatDerivationSection(input: {
     '',
     `当前派生权限：${input.allowed ? '允许' : '不允许'}。${input.reason}`,
     input.workDir ? `当前任务工作目录：${input.workDir}` : '',
+    input.workspaceMode !== 'isolated' ? '当前使用共享工作区：父子任务直接在同一目录协作，改动实时可见。' : '当前使用独立工作区：保留已有任务的隔离与版本验收规则。',
     '',
     '已有子任务：'
   ]
@@ -173,7 +196,7 @@ export function formatDerivationSection(input: {
       : ''
     const waived = child.waived ? '；已解除必要性' : ''
     const version = child.delivery?.version ? `；交付版本 ${child.delivery.version}` : ''
-    lines.push(`- ${child.task_id} ${child.title || ''} 状态 ${child.unreadable ? '损坏（无法读取状态）' : child.status}${child.work_dir ? `；目录 ${child.work_dir}` : ''}${version}${review}${waived}`)
+    lines.push(`- ${child.task_id} ${child.title || ''} 状态 ${child.unreadable ? '损坏（无法读取状态）' : child.status}${child.work_dir ? `；目录 ${child.work_dir}` : ''}${child.workspace_mode ? `；${child.workspace_mode === 'shared' ? '共享工作区' : '独立工作区'}` : ''}${version}${review}${waived}`)
   }
   lines.push('', '当前方案确认进度：')
   if (!input.proposal || input.proposal.status === 'rejected') {
@@ -200,15 +223,22 @@ export function formatDerivationSection(input: {
     command('decide disagree 理由'),
     command('create'),
     command('wait'),
-    command('submit --version VERSION --artifacts PATHS --verification RESULT --issues TEXT'),
+    command('submit --artifacts PATHS --verification RESULT --issues TEXT'),
     command('review CHILD_TASK_ID accept 意见'),
     command('review CHILD_TASK_ID reject 意见'),
     command('waive CHILD_TASK_ID 原因'),
     command('restart CHILD_TASK_ID'),
     '',
-    `方案写到 ${input.specFile}。不要把方案文件写进当前工作目录，未跟踪文件会让创建被拒绝。`,
+    `等待协议：wait 在当前 Actor 回合内只登记等待，返回 deferred=true / next_action=finish_turn 时，${FINISH_WAIT_TURN}`,
+    'status 的顶层 delivery、acceptance、work_dir 只属于当前任务；子任务状态和交付请读取 child_details。子任务产物路径相对该子任务的 work_dir，不能用父任务目录下没有文件来判断尚未交付。',
+    '最终回复若要说明子任务仍在运行、等待交付或能否验收，请在结束本轮前通过 status 复核一次最新状态；不要沿用本轮开始时的快照，也不要轮询等待。',
+    '新子任务默认共享父任务当前工作目录，包含已有未提交改动；无需清理、提交、复制或合并整个工作区。方案必须写清各任务负责的文件/模块、接口和依赖。父任务与兄弟任务不要同时修改已委派的范围；发现重叠先协调分工或等待依赖，不得擅自覆盖或回退他人改动。',
+    '共享任务的 Git 提交由根任务按用户要求统一安排。子任务不得为了交付自行执行 stash、reset、checkout、commit、push 或 cherry-pick。submit 自动生成本任务的 delivery-N 交付编号，不绑定 Git HEAD；父任务检查共享目录当前代码及实际测试后验收，不需要为了交付创建 commit。',
+    '确实需要隔离时，在方案的 workspace_mode 中显式填写 isolated 并由双方确认；它基于已提交 HEAD 创建独立工作区，不包含父任务未提交改动。已有隔离任务沿用原目录及 Git 版本校验，不自动迁移。',
+    ...(input.workspaceMode === 'isolated' ? ['当前隔离任务的 submit 自动读取 Git HEAD 的完整提交编号，并校验工作区干净；--version 如有填写必须与 HEAD 一致。提交 Git 仍须符合用户要求，不能为了交付擅自提交。'] : []),
+    `方案写到 ${input.specFile}。不要把方案文件写进当前工作目录，与项目代码分开存放，避免把调度记录混入业务改动。`,
     '文件内容形如 {"specs":[{"key":"api","title":"标题","goal":"目标","scope":"范围","context":"上下文","dependencies":[],"deliverables":"交付物","acceptance":"验收条件"}]}。',
-    '独立子任务会真正并行启动。修改方案后必须双方重新确认。重复创建不会产生第二份任务。',
+    '无依赖且写入范围不重叠的子任务会并行启动。有依赖或文件范围重叠时应串行推进。修改方案后必须双方重新确认。重复创建不会产生第二份任务。',
     '已取消的子任务会挡住父任务结束，除非父任务用 waive 写明原因并解除必要性。失败的子任务用 restart 重新启动；要放弃它，先取消再用 waive。',
     '子任务必须先 submit，再由双方确认结束。没有交付记录时，不会进入父任务验收。'
   )
@@ -244,7 +274,8 @@ function canonicalSpec(spec: DerivationSpec): DerivationSpec {
     context: spec.context,
     dependencies: [...spec.dependencies],
     deliverables: spec.deliverables,
-    acceptance: spec.acceptance
+    acceptance: spec.acceptance,
+    ...(spec.workspace_mode ? { workspace_mode: spec.workspace_mode } : {})
   }
 }
 
@@ -255,6 +286,9 @@ function readSpec(value: unknown): DerivationSpec {
   if (!KEY_PATTERN.test(key)) throw new Error('子任务 key 只能使用字母、数字、点、下划线和短横线，最长 40 字符')
   const title = typeof raw.title === 'string' ? raw.title.trim() : ''
   if (!title) throw new Error(`子任务 ${key} 缺少标题`)
+  if (raw.workspace_mode !== undefined && raw.workspace_mode !== 'shared' && raw.workspace_mode !== 'isolated') {
+    throw new Error(`子任务 ${key} 的 workspace_mode 只能是 shared 或 isolated`)
+  }
   const text = (field: string, limit = 8000) => {
     const item = raw[field]
     const valueText = typeof item === 'string' ? item.trim() : ''
@@ -272,7 +306,8 @@ function readSpec(value: unknown): DerivationSpec {
     context: text('context'),
     dependencies,
     deliverables: text('deliverables'),
-    acceptance: text('acceptance')
+    acceptance: text('acceptance'),
+    ...(raw.workspace_mode ? { workspace_mode: raw.workspace_mode as 'shared' | 'isolated' } : {})
   }
 }
 
@@ -359,23 +394,7 @@ export class DerivationService {
       status: state.status,
       allowNested: global.allow_nested_derivation ?? false
     })
-    const children = []
-    for (const childId of state.child_task_ids ?? []) {
-      try {
-        const child = await this.store.readTaskState(childId, workspaceKey)
-        children.push({
-          task_id: childId,
-          title: child.title,
-          status: child.status,
-          work_dir: child.work_dir,
-          delivery: child.delivery,
-          acceptance: child.acceptance,
-          waived: Boolean(child.waiver?.reason)
-        })
-      } catch {
-        children.push({ task_id: childId, status: 'FAILED', unreadable: true })
-      }
-    }
+    const children = await this.childDetails(state, workspaceKey)
     return formatDerivationSection({
       allowed: permission.allowed,
       reason: permission.reason,
@@ -384,9 +403,36 @@ export class DerivationService {
       actors: { implementer: implementerActor(settings), reviewer: reviewerActor(settings) },
       children,
       workDir: state.work_dir,
+      workspaceMode: state.workspace_mode ?? (state.parent_task_id ? 'isolated' : 'shared'),
       session,
       specFile: join(this.store.taskDirectory(taskId, workspaceKey), 'artifacts', 'derivation-spec.json')
     })
+  }
+
+  /** Used by both prompts and the live status command, including children created this turn. */
+  private async childDetails(state: TaskState, workspaceKey: string): Promise<DerivationChildDetail[]> {
+    const children: DerivationChildDetail[] = []
+    for (const childId of state.child_task_ids ?? []) {
+      try {
+        const child = await this.store.readTaskState(childId, workspaceKey)
+        children.push({
+          task_id: childId,
+          title: child.title || childId,
+          status: child.status,
+          work_dir: child.work_dir ?? null,
+          workspace_mode: child.workspace_mode ?? 'isolated',
+          delivery: child.delivery ?? null,
+          acceptance: child.acceptance ?? null,
+          waived: Boolean(child.waiver?.reason)
+        })
+      } catch {
+        children.push({
+          task_id: childId, title: childId, status: null, unreadable: true,
+          work_dir: null, workspace_mode: 'isolated', delivery: null, acceptance: null, waived: false
+        })
+      }
+    }
+    return children
   }
 
   async status(taskId: string, workspaceKey: string) {
@@ -399,14 +445,22 @@ export class DerivationService {
       allowNested: global.allow_nested_derivation ?? false
     })
     return {
+      task_id: taskId,
+      status: state.status,
       allowed: permission.allowed,
       reason: permission.reason,
       actors: actorsOf(settings),
       children: state.child_task_ids ?? [],
+      child_details: await this.childDetails(state, workspaceKey),
       proposal: state.derivation_proposal ?? null,
       delivery: state.delivery ?? null,
       acceptance: state.acceptance ?? null,
-      work_dir: state.work_dir ?? null
+      work_dir: state.work_dir ?? null,
+      workspace_mode: state.workspace_mode ?? (state.parent_task_id ? 'isolated' : 'shared'),
+      next_action: state.derivation_hold === 'children' && state.active_run ? 'finish_turn' : 'continue',
+      message: state.derivation_hold === 'children' && state.active_run
+        ? FINISH_WAIT_TURN
+        : '顶层 delivery、acceptance、work_dir 属于当前任务；子任务交付和产物目录请读取 child_details。'
     }
   }
 
@@ -528,6 +582,9 @@ export class DerivationService {
           if (existing.parent_task_id !== taskId || existing.spec_key !== spec.key) {
             throw new Error(`子任务标识已被占用：${childId}`)
           }
+          if (spec.workspace_mode && spec.workspace_mode !== (existing.workspace_mode ?? 'isolated')) {
+            throw new Error(`子任务 ${spec.key} 已有不同工作区模式，不能通过重新创建迁移；请使用新的 key 明确派生`)
+          }
           const detail = await this.store.getTaskDetail(childId, workspaceKey)
           if (detail.task_text.trim() !== taskTextOf(spec, taskId).trim()) {
             throw new Error(`子任务标识 ${spec.key} 已有不同内容的任务，新方案不能沿用旧任务`)
@@ -543,7 +600,8 @@ export class DerivationService {
           created.push(childId)
           continue
         }
-        const workDir = await this.allocateWorkDir(state, workspaceKey, childId)
+        const workspaceMode = spec.workspace_mode ?? 'shared'
+        const workDir = await this.allocateWorkDir(state, workspaceKey, childId, workspaceMode)
         await stopIfParentClosed()
         await this.store.createTask({
           task_id: childId,
@@ -558,6 +616,7 @@ export class DerivationService {
           derivation_depth: (state.derivation_depth ?? 0) + 1,
           title: spec.title,
           work_dir: workDir,
+          workspace_mode: workspaceMode,
           spec_key: spec.key,
           depends_on_task_ids: dependsOn,
           dependency_blocked: dependsOn.length > 0
@@ -594,7 +653,7 @@ export class DerivationService {
     })
   }
 
-  async wait(taskId: string, workspaceKey: string): Promise<{ waiting: boolean; deferred: boolean }> {
+  async wait(taskId: string, workspaceKey: string): Promise<DerivationWaitResult> {
     return this.lock(`${workspaceKey}:${taskId}`, () => this.enterWait(taskId, workspaceKey))
   }
 
@@ -608,9 +667,17 @@ export class DerivationService {
       const state = await this.store.readTaskState(taskId, workspaceKey)
       this.assertMutable(state)
       if (!state.parent_task_id) throw new Error('只有子任务需要向父任务提交交付')
-      const version = (input.version || '').trim() || await this.headVersion(state.work_dir) || 'unversioned'
+      const revision = state.delivery ? (state.delivery.revision ?? 1) + 1 : 1
+      let version: string
+      if (state.workspace_mode === 'shared') {
+        await this.assertSharedWorkDir(state.work_dir)
+        version = `delivery-${revision}`
+      } else {
+        version = await this.checkedDeliveryVersion(state.work_dir, input.version)
+      }
       const delivery: TaskDelivery = {
         version,
+        revision,
         artifacts: input.artifacts?.trim() || '',
         verification: input.verification?.trim() || '',
         open_issues: input.open_issues?.trim() || '',
@@ -619,10 +686,11 @@ export class DerivationService {
       }
       await this.store.updateTaskState(taskId, workspaceKey, current => {
         this.assertMutable(current)
-        return { ...current, delivery, acceptance: null, updated_at: utcNow() }
+        return { ...current, delivery, acceptance: null, pending_break: null, break_rejected_by: null, updated_at: utcNow() }
       })
-      await this.note(taskId, workspaceKey, 'derivation.submitted', `${actor} 提交了交付，版本 ${version}。`, { version })
-      await this.notifyParent(taskId, workspaceKey, `子任务 ${state.title || taskId} 已提交交付。版本 ${version}。验证：${delivery.verification || '未填写'}。未解决问题：${delivery.open_issues || '无'}。`, false)
+      const resubmitted = revision > 1
+      await this.note(taskId, workspaceKey, 'derivation.submitted', `${actor} ${resubmitted ? '重新提交' : '提交'}了交付，版本 ${version}。`, { version, delivery_revision: delivery.revision })
+      await this.notifyParent(taskId, workspaceKey, `子任务 ${state.title || taskId} ${resubmitted ? '已重新提交交付' : '已提交交付'}。版本 ${version}。验证：${delivery.verification || '未填写'}。未解决问题：${delivery.open_issues || '无'}。`, false, 'submitted')
       return delivery
     })
   }
@@ -656,14 +724,7 @@ export class DerivationService {
         if (unfinished.length > 0) {
           throw new Error(`子任务还有未完成的下级，不能验收：${unfinished.join(', ')}`)
         }
-        const dirty = await this.dirtyWorktree(child.work_dir)
-        if (dirty) {
-          throw new Error(`子任务工作区还有未提交的改动，不能验收通过：${dirty.slice(0, 300)}`)
-        }
-        const head = await this.headVersion(child.work_dir)
-        if (head && child.delivery.version && head !== child.delivery.version) {
-          throw new Error(`工作区版本 ${head} 与交付版本 ${child.delivery.version} 不一致，不能沿用这次通过结论`)
-        }
+        await this.validateDelivery(child)
         const cleaned = await this.hooks.cleanup(childId, workspaceKey)
         if (!cleaned) throw new Error('子任务后台服务还没清理完，先不要标成已验收')
       }
@@ -773,14 +834,19 @@ export class DerivationService {
     })
   }
 
-  async notifyParent(childId: string, workspaceKey: string, message: string, failure: boolean): Promise<void> {
+  async notifyParent(childId: string, workspaceKey: string, message: string, failure: boolean, deliveryStage: 'submitted' | 'ready' = 'ready'): Promise<void> {
     const child = await this.store.readTaskState(childId, workspaceKey)
     if (!child.parent_task_id) return
     const parentId = child.parent_task_id
     await this.lock(`${workspaceKey}:${parentId}`, async () => {
       const parent = await this.store.readTaskState(parentId, workspaceKey).catch(() => null)
       if (!parent || parent.status === 'CANCELLED' || parent.status === 'DONE') return
-      await this.note(parentId, workspaceKey, failure ? 'derivation.child_failed' : 'derivation.child_delivered', message, { child_task_id: childId })
+      const kind = failure ? 'derivation.child_failed'
+        : deliveryStage === 'submitted' ? 'derivation.child_submitted' : 'derivation.child_delivered'
+      await this.note(parentId, workspaceKey, kind, message, {
+        child_task_id: childId, child_status: child.status,
+        version: child.delivery?.version ?? null, delivery_revision: child.delivery?.revision ?? (child.delivery ? 1 : null)
+      })
       if (!childResultNeedsParent(child)) return
       if (parent.pause_cause === 'user') return
       let wake = false
@@ -926,7 +992,7 @@ export class DerivationService {
   }
 
   /** Called only under the derivation lock; the state callback checks the latest snapshot. */
-  private async enterWait(taskId: string, workspaceKey: string): Promise<{ waiting: boolean; deferred: boolean }> {
+  private async enterWait(taskId: string, workspaceKey: string): Promise<DerivationWaitResult> {
     const ready = await this.childrenNeedParent(taskId, workspaceKey)
     let deferred = false
     let wake = false
@@ -945,14 +1011,18 @@ export class DerivationService {
         derivation_hold: null, derivation_wake_pending: null, countdown: null, updated_at: utcNow()
       }
     })
-    if (deferred) return { waiting: false, deferred: true }
+    if (deferred) return { waiting: false, deferred: true, next_action: 'finish_turn', message: FINISH_WAIT_TURN }
     if (wake) {
       void this.hooks.startTask(taskId, workspaceKey).catch(() => {})
     } else {
       await this.note(taskId, workspaceKey, 'derivation.waiting', '父任务开始等待子任务，不再占用执行名额。', {})
     }
     this.hooks.terminal(workspaceKey)
-    return { waiting: !wake, deferred: false }
+    return {
+      waiting: !wake, deferred: false,
+      next_action: wake ? 'continue' : 'wait_for_children',
+      message: wake ? '子任务已有结果需要处理，Buddy 将继续父任务。' : '父任务已进入等待，Buddy 会在子任务需要处理时恢复执行。'
+    }
   }
 
   private async kickAll(taskIds: string[], workspaceKey: string): Promise<void> {
@@ -1141,8 +1211,16 @@ export class DerivationService {
   private async allocateWorkDir(
     parent: { repo_root?: string; work_dir?: string },
     workspaceKey: string,
-    taskId: string
+    taskId: string,
+    mode: 'shared' | 'isolated' = 'isolated'
   ): Promise<string> {
+    if (mode === 'shared') {
+      const shared = parent.work_dir || parent.repo_root
+      if (!shared) throw new Error('父任务没有可共享的工作目录，请先设置项目目录')
+      await mkdir(shared, { recursive: true })
+      await this.assertSharedWorkDir(shared)
+      return realpath(shared)
+    }
     const dir = join(this.store.dataRoot, 'runtime', 'worktrees', workspaceKey, taskId)
     await mkdir(join(this.store.dataRoot, 'runtime', 'worktrees', workspaceKey), { recursive: true })
     const base = await this.gitWorkBase(parent.work_dir) ?? await this.gitWorkBase(parent.repo_root)
@@ -1208,6 +1286,55 @@ export class DerivationService {
     }
   }
 
+  /** Snapshot actual child state if asynchronous results arrived while this actor was generating. */
+  async completionChildUpdates(taskId: string, state: TaskState, workspaceKey: string, runId: string) {
+    if (!state.child_task_ids?.length) return []
+    const { events } = await this.store.getEvents(taskId, 0, workspaceKey)
+    const started = events.find(e => e.type === 'actor.started' && (e.run_id ?? e.payload.run_id) === runId)
+    if (!started) return []
+    const changed = new Set(events.filter(e => e.seq > started.seq
+      && ['derivation.child_submitted', 'derivation.child_delivered', 'derivation.child_failed'].includes(e.type))
+      .map(e => e.payload.child_task_id))
+    if (!changed.size) return []
+    const children = await this.childDetails({ ...state, child_task_ids: state.child_task_ids.filter(id => changed.has(id)) }, workspaceKey)
+    return children.map(child => ({
+      child_task_id: child.task_id, title: child.title, child_status: child.status,
+      version: child.delivery?.version ?? null, delivery_revision: child.delivery?.revision ?? (child.delivery ? 1 : null)
+    }))
+  }
+
+  /** Reused at the child completion boundary and parent acceptance, including legacy records. */
+  async validateDelivery(state: Pick<TaskState, 'work_dir' | 'delivery' | 'workspace_mode'>): Promise<void> {
+    if (!state.delivery?.version) throw new Error('还没有向父任务提交交付')
+    if (state.workspace_mode === 'shared') {
+      await this.assertSharedWorkDir(state.work_dir)
+      return
+    }
+    await this.checkedDeliveryVersion(state.work_dir, state.delivery.version)
+  }
+
+  private async assertSharedWorkDir(workDir?: string): Promise<void> {
+    if (!workDir || !(await stat(workDir).catch(() => null))?.isDirectory()) {
+      throw new Error('共享工作目录不存在或不可访问，请先恢复工作目录；不会改用其他目录执行')
+    }
+  }
+
+  private async checkedDeliveryVersion(workDir?: string, requestedVersion?: string): Promise<string> {
+    const requested = (requestedVersion || '').trim()
+    const gitDir = await this.gitWorkBase(workDir)
+    // Keep the existing non-Git delivery contract. Git worktrees always bind to a clean HEAD.
+    if (!gitDir) return requested || 'unversioned'
+    const head = await this.headVersion(gitDir)
+    if (!head) throw new Error('Git 工作区没有可读取的 HEAD 提交编号，不能提交交付；请按用户允许的 Git 策略处理')
+    const status = await runGit(gitDir, ['status', '--porcelain'])
+    if (!status.ok) throw new Error(`无法读取 Git 工作区状态，不能确认交付版本：${status.stderr || status.stdout}`)
+    if (status.stdout) throw new Error(`子任务工作区还有未提交的改动，不能提交交付或进入待验收；请按用户允许的 Git 策略处理后重新 submit：${status.stdout.slice(0, 300)}`)
+    if (requested && requested !== head) {
+      throw new Error(`交付版本 ${requested} 与工作区版本 ${head} 不一致；version 是 Git 提交编号，请省略 --version 由 Buddy 自动读取`)
+    }
+    return head
+  }
+
   private async headVersion(workDir?: string): Promise<string | null> {
     if (!workDir) return null
     const result = await runGit(workDir, ['rev-parse', 'HEAD'])
@@ -1225,7 +1352,7 @@ export class DerivationService {
 
   private async note(taskId: string, workspaceKey: string, type: string, message: string, payload: Record<string, unknown>): Promise<void> {
     const event = await this.store.appendTaskEvent(taskId, workspaceKey, { type, payload: { message, ...payload } })
-    await this.store.appendTranscript(taskId, workspaceKey, 'system', message, { kind: type })
+    await this.store.appendTranscript(taskId, workspaceKey, 'system', message, { ...payload, kind: type, event_seq: event.seq })
     this.hooks.events?.publish({ workspace_key: workspaceKey, task_id: taskId, event })
   }
 

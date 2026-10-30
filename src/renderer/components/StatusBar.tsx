@@ -16,6 +16,7 @@ import {
   decodeErrorText,
   eventPayloadSummary,
   eventTypeLabel,
+  derivationEventDetails,
   isHiddenEvent
 } from '../lib/format'
 import { useLanguage, useT } from '../hooks/useI18n'
@@ -425,6 +426,7 @@ function EventLog({ events, t, lang }: { events: Event[]; t: TFunction; lang: La
     return <div className="px-4 pb-4 text-xs text-fg-muted">{t('statusBar.eventsEmpty')}</div>
   }
   const canExpand = visibleEvents.length > 10
+  const eventDetails = derivationEventDetails(events)
   const displayed = expanded ? [...visibleEvents].reverse() : visibleEvents.slice(-10).reverse()
   return (
     <div className="px-4 pb-3 space-y-2">
@@ -440,7 +442,7 @@ function EventLog({ events, t, lang }: { events: Event[]; t: TFunction; lang: La
           <div key={event.seq} className="text-xs">
             <div className="flex items-baseline justify-between gap-3">
               <span className={`truncate ${failed ? 'text-danger' : ''}`}>
-                {event.seq} · {eventTypeLabel(event.type, lang)}
+                {event.seq} · {eventTypeLabel(event.type, lang, eventDetails.get(event.seq) ?? event.payload)}
               </span>
               <span className="text-fg-secondary flex-shrink-0">
                 {event.actor ? `${actorLabel(event.actor, t)} ` : ''}

@@ -1734,18 +1734,29 @@ export class BuddyRunner {
     const breakRejected = message.kind !== 'break' && Boolean(pendingBreak?.actor)
     const hasQueuedInstructions = (currentState.instruction_queue?.length ?? 0) > 0
     const childSnapshots = breakConfirmed ? await this.childSnapshots(currentState, workspaceKey) : []
-    const breakOutcome = breakConfirmed ? resolveBreakOutcome(currentState, childSnapshots) : null
+    let breakOutcome = breakConfirmed ? resolveBreakOutcome(currentState, childSnapshots) : null
+    let deliveryIssue: string | undefined
+    if (breakOutcome === 'await_parent') {
+      try {
+        await this.derivation.validateDelivery(currentState)
+      } catch (error) {
+        deliveryIssue = error instanceof Error ? error.message : String(error)
+        breakOutcome = 'needs_delivery'
+      }
+    }
     const holdChildren = shouldEnterChildWait(currentState, breakConfirmed, breakPending)
     const pendingChildResults = holdChildren
       ? Boolean(currentState.derivation_wake_pending) || await this.derivation.childrenNeedParent(taskId, workspaceKey)
       : false
     const cleaned = breakOutcome !== 'done' || hasQueuedInstructions || await this.cleanupServices(taskId, workspaceKey)
 
+    const childUpdates = await this.derivation.completionChildUpdates(taskId, currentState, workspaceKey, runId)
     await this.store.appendTranscript(taskId, workspaceKey, normalizeActorRole(actor), transcriptContent, {
       round,
       run_id: runId,
       elapsed_ms: elapsedMs,
-      buddy_type: buddyType
+      buddy_type: buddyType,
+      ...(childUpdates.length ? { child_updates: childUpdates } : {})
     })
     await this.store.appendTaskEvent(taskId, workspaceKey, {
       type: 'actor.completed',
@@ -1866,12 +1877,14 @@ export class BuddyRunner {
         taskId,
         workspaceKey,
         'system',
-        '还没有向父任务提交交付，不能进入待验收。请先 submit，再由双方确认结束。',
+        deliveryIssue
+          ? `交付校验未通过：${deliveryIssue}。不能进入待验收，请处理后重新 submit，再由双方确认结束。`
+          : '还没有向父任务提交交付，不能进入待验收。请先 submit，再由双方确认结束。',
         { kind: 'round_notice', round }
       )
       await this.store.appendTaskEvent(taskId, workspaceKey, {
         type: 'task.delivery_required',
-        payload: { round }
+        payload: { round, ...(deliveryIssue ? { reason: deliveryIssue } : {}) }
       })
     }
 

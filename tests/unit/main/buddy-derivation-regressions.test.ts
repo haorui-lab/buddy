@@ -11,6 +11,7 @@ import { taskChildren } from '../../../src/renderer/lib/taskList'
 import type { DerivationSpec, Task } from '../../../src/shared/types'
 
 const spec = (key = 'child', goal = `goal ${key}`): DerivationSpec => ({
+  workspace_mode: 'isolated',
   key,
   title: key,
   goal,

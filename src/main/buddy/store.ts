@@ -156,6 +156,7 @@ export class BuddyStore {
       state.derivation_depth = input.derivation_depth ?? 1
       state.title = input.title
       state.work_dir = input.work_dir
+      state.workspace_mode = input.workspace_mode
       state.spec_key = input.spec_key
       state.depends_on_task_ids = input.depends_on_task_ids ?? []
       state.child_task_ids = []

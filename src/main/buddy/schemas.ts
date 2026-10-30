@@ -52,6 +52,7 @@ const taskStatusSchema = z.enum([
 const executionModeSchema = z.enum(['immediate', 'queued'])
 
 const derivationSpecSchema = z.object({
+  workspace_mode: z.enum(['shared', 'isolated']).optional(),
   key: z.string(),
   title: z.string(),
   goal: z.string().default(''),
@@ -82,6 +83,7 @@ const derivationProposalSchema = z.object({
 })
 
 const taskDeliverySchema = z.object({
+  revision: z.number().int().positive().optional(),
   version: z.string(),
   artifacts: z.string().default(''),
   verification: z.string().default(''),
@@ -201,6 +203,7 @@ export const taskStateSchema = z.object({
   child_task_ids: z.array(z.string()).optional(),
   title: z.string().optional(),
   work_dir: z.string().optional(),
+  workspace_mode: z.enum(['shared', 'isolated']).optional(),
   spec_key: z.string().optional(),
   depends_on_task_ids: z.array(z.string()).optional(),
   dependency_blocked: z.boolean().optional(),

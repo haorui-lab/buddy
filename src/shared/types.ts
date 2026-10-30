@@ -115,6 +115,7 @@ export interface TaskState {
   child_task_ids?: string[]
   title?: string
   work_dir?: string
+  workspace_mode?: 'shared' | 'isolated'
   spec_key?: string
   depends_on_task_ids?: string[]
   dependency_blocked?: boolean
@@ -131,6 +132,8 @@ export interface TaskState {
 }
 
 export interface DerivationSpec {
+  /** Defaults to shared for new children. Isolation must be explicitly agreed in the proposal. */
+  workspace_mode?: 'shared' | 'isolated'
   key: string
   title: string
   goal: string
@@ -162,6 +165,8 @@ export interface DerivationProposal {
 
 export interface TaskDelivery {
   version: string
+  /** Submission count, independent of Git. Shared tasks use delivery-N receipt IDs. */
+  revision?: number
   artifacts: string
   verification: string
   open_issues: string
@@ -374,6 +379,7 @@ export interface CreateTaskInput {
   derivation_depth?: number
   title?: string
   work_dir?: string
+  workspace_mode?: 'shared' | 'isolated'
   spec_key?: string
   depends_on_task_ids?: string[]
   dependency_blocked?: boolean

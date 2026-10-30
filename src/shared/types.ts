@@ -120,6 +120,8 @@ export interface TaskState {
   dependency_blocked?: boolean
   pause_cause?: 'user' | 'cascade' | null
   pause_resume_status?: TaskStatus
+  /** 只在 status=CANCELLED 时有意义：creation_rollback 是创建中途父任务停止时的系统回滚，重试 create 时可复活；user 是用户主动取消，不能被悄悄拉起。 */
+  cancel_cause?: 'user' | 'creation_rollback' | null
   derivation_hold?: 'children' | null
   derivation_wake_pending?: boolean | null
   derivation_proposal?: DerivationProposal | null

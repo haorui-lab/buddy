@@ -508,4 +508,190 @@ describe('derivation review regressions', () => {
     ] as Task[], 'same-root', 'project-a')
     expect(children.map(item => item.workspace_key)).toEqual(['project-a'])
   })
+
+  it('revives a child cancelled by a mid-creation pause when create is retried, and starts it', async () => {
+    const ctx = await setup()
+    await ctx.runner.startTask('root', { workspace_key: ctx.ws })
+    await ctx.service.propose('root', ctx.ws, 'claude', [spec()])
+    await ctx.service.decide('root', ctx.ws, 'claude', 'agree', 'yes')
+    await ctx.service.decide('root', ctx.ws, 'codex', 'agree', 'yes')
+    const original = ctx.store.createTask.bind(ctx.store)
+    let arrived!: () => void
+    const blocked = new Promise<void>(resolve => { arrived = resolve })
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    ctx.store.createTask = async input => {
+      if (input.parent_task_id === 'root') {
+        arrived()
+        await gate
+      }
+      return original(input)
+    }
+    const creation = ctx.service.create('root', ctx.ws)
+    await blocked
+    await ctx.runner.interrupt('root', ctx.ws)
+    release()
+    await expect(creation).rejects.toThrow(/暂停/)
+    const childId = derivedTaskId('root', 'child')
+    expect((await ctx.store.readTaskState(childId, ctx.ws)).status).toBe('CANCELLED')
+
+    // 父任务恢复后重试 create：回滚取消的子任务必须复活并被启动，不能停在 CANCELLED。
+    await ctx.store.updateTaskState('root', ctx.ws, current => ({
+      ...current, status: 'READY', active_run: null, pause_cause: null, pause_resume_status: undefined
+    }))
+    const started: string[] = []
+    const startSpy = vi.spyOn(ctx.runner, 'startTask')
+    startSpy.mockImplementation(async (taskId: string, input: { workspace_key: string }) => {
+      started.push(taskId)
+      await ctx.store.updateTaskState(taskId, input.workspace_key, current => ({ ...current, status: 'RUNNING_CLAUDE' }))
+      return { run_id: `run-${taskId}` }
+    })
+    const retried = await ctx.service.create('root', ctx.ws)
+    expect(retried.task_ids).toEqual([childId])
+    const revived = await ctx.store.readTaskState(childId, ctx.ws)
+    expect(revived.status.startsWith('RUNNING')).toBe(true)
+    expect(revived.cancel_cause ?? null).toBeNull()
+    expect(started).toContain(childId)
+    // 方案落成 created，父任务的 child_task_ids 也已登记。
+    const parent = await ctx.store.readTaskState('root', ctx.ws)
+    expect(parent.derivation_proposal?.status).toBe('created')
+    expect(parent.child_task_ids).toContain(childId)
+    startSpy.mockRestore()
+  })
+
+  it('does not revive a child the user cancelled themselves', async () => {
+    const ctx = await setup()
+    const [child] = await derive(ctx, 'root')
+    // 用户主动取消：cancelTask 是 runner 的路径，这里直接构造用户取消后的状态。
+    await ctx.store.updateTaskState(child, ctx.ws, current => ({
+      ...current, status: 'CANCELLED', cancel_cause: 'user', active_run: null
+    }))
+    // 同一方案再次 create（提案已是 created，走 reused 分支）不能把用户取消的子任务拉起来。
+    const result = await ctx.service.create('root', ctx.ws)
+    expect(result.task_ids).toEqual([child])
+    expect((await ctx.store.readTaskState(child, ctx.ws)).status).toBe('CANCELLED')
+    // 用户取消的子任务挡住父任务结束，只能 waive，这与提示语义一致。
+    const parent = await ctx.store.readTaskState('root', ctx.ws)
+    const snapshots = await (ctx.runner as unknown as { childSnapshots: (state: typeof parent, ws: string) => Promise<{ status: string; waived?: boolean }[]> }).childSnapshots(parent, ctx.ws)
+    expect(snapshots[0].status).toBe('CANCELLED')
+  })
+
+  it('revives and starts children rolled back after the proposal was already saved as created', async () => {
+    const ctx = await setup()
+    await ctx.service.propose('root', ctx.ws, 'claude', [spec()])
+    await ctx.service.decide('root', ctx.ws, 'claude', 'agree', 'yes')
+    await ctx.service.decide('root', ctx.ws, 'codex', 'agree', 'yes')
+    const childId = derivedTaskId('root', 'child')
+
+    // 注入点：note(derivation.created) 发生在「方案写成 created」之后、kickAll 之前。
+    // 拦截 appendTaskEvent，遇到 derivation.created 时把父任务置 PAUSED，模拟用户暂停赢了。
+    // 这样第一次 create 在 kickAll 前被 stopIfParentClosed 打断，回滚取消新子任务，
+    // 而方案已经落成 created——正是审查指出的 reused 早退场景。
+    const originalAppend = ctx.store.appendTaskEvent.bind(ctx.store)
+    const appendSpy = vi.spyOn(ctx.store, 'appendTaskEvent').mockImplementation(async (id: string, key: string, event: { type: string }) => {
+      if (id === 'root' && event.type === 'derivation.created') {
+        appendSpy.mockRestore()
+        await ctx.store.updateTaskState('root', key, s => ({ ...s, status: 'PAUSED', active_run: null }))
+      }
+      return originalAppend(id, key, event)
+    })
+    await expect(ctx.service.create('root', ctx.ws)).rejects.toThrow(/暂停/)
+    appendSpy.mockRestore()
+
+    const mid = await ctx.store.readTaskState(childId, ctx.ws)
+    expect(mid.status).toBe('CANCELLED')
+    expect(mid.cancel_cause).toBe('creation_rollback')
+    expect((await ctx.store.readTaskState('root', ctx.ws)).derivation_proposal?.status).toBe('created')
+
+    // 父任务恢复后再次 create：走 reused 早退，早退前必须复活并启动子任务。
+    await ctx.store.updateTaskState('root', ctx.ws, s => ({ ...s, status: 'READY', pause_cause: null }))
+    const started: string[] = []
+    const startSpy = vi.spyOn(ctx.runner, 'startTask')
+    startSpy.mockImplementation(async (taskId: string, input: { workspace_key: string }) => {
+      started.push(taskId)
+      await ctx.store.updateTaskState(taskId, input.workspace_key, current => ({ ...current, status: 'RUNNING_CLAUDE' }))
+      return { run_id: `run-${taskId}` }
+    })
+    const result = await ctx.service.create('root', ctx.ws)
+    expect(result.reused).toBe(true)
+    expect(result.task_ids).toEqual([childId])
+    const child = await ctx.store.readTaskState(childId, ctx.ws)
+    expect(child.status.startsWith('RUNNING')).toBe(true)
+    expect(child.cancel_cause ?? null).toBeNull()
+    expect(started).toContain(childId)
+    startSpy.mockRestore()
+  })
+
+  it('reused create leaves a user-cancelled child alone even after a rollback cancel elsewhere', async () => {
+    const ctx = await setup()
+    const [child] = await derive(ctx, 'root')
+    // 提案已是 created（derive 完成）。用户取消其中一个子任务后再次 create：
+    // 早退分支不能把它复活。
+    await ctx.store.updateTaskState(child, ctx.ws, current => ({
+      ...current, status: 'CANCELLED', cancel_cause: 'user', active_run: null
+    }))
+    const startSpy = vi.spyOn(ctx.runner, 'startTask')
+    startSpy.mockImplementation(async () => ({ run_id: 'should-not-run' }))
+    const result = await ctx.service.create('root', ctx.ws)
+    expect(result.reused).toBe(true)
+    expect((await ctx.store.readTaskState(child, ctx.ws)).status).toBe('CANCELLED')
+    expect(startSpy.mock.calls.map(call => String(call[0]))).toEqual([])
+    startSpy.mockRestore()
+  })
+
+  it('revives a queued child back into the waiting queue so the coordinator can pick it up', async () => {
+    const ctx = await setup()
+    // 排队执行的父任务：createTask 时 execution_mode=queued，子任务也是 queued。
+    await ctx.store.updateTaskState('root', ctx.ws, current => ({ ...current, execution_mode: 'queued' }))
+    await ctx.service.propose('root', ctx.ws, 'claude', [spec()])
+    await ctx.service.decide('root', ctx.ws, 'claude', 'agree', 'yes')
+    await ctx.service.decide('root', ctx.ws, 'codex', 'agree', 'yes')
+    const childId = derivedTaskId('root', 'child')
+
+    // 与立即模式用例同一个注入点：方案写成 created 之后、kickAll/terminal 之前，
+    // 把父任务置 PAUSED，触发 stopIfParentClosed 回滚取消新建的排队子任务。
+    const originalAppend = ctx.store.appendTaskEvent.bind(ctx.store)
+    const appendSpy = vi.spyOn(ctx.store, 'appendTaskEvent').mockImplementation(async (id: string, key: string, event: { type: string }) => {
+      if (id === 'root' && event.type === 'derivation.created') {
+        appendSpy.mockRestore()
+        await ctx.store.updateTaskState('root', key, s => ({ ...s, status: 'PAUSED', active_run: null }))
+      }
+      return originalAppend(id, key, event)
+    })
+    await expect(ctx.service.create('root', ctx.ws)).rejects.toThrow(/暂停/)
+    appendSpy.mockRestore()
+
+    const mid = await ctx.store.readTaskState(childId, ctx.ws)
+    expect(mid.status).toBe('CANCELLED')
+    expect(mid.cancel_cause).toBe('creation_rollback')
+    expect(mid.execution_mode).toBe('queued')
+
+    // 父任务恢复后再次 create：排队子任务必须回到 QUEUED + queue.state=waiting，
+    // 不能停在 READY 堵死队列。协调器由此可以选中它。
+    // 排队任务的恢复目标是 QUEUED（resume 语义如此），不用 READY。
+    await ctx.store.updateTaskState('root', ctx.ws, s => ({ ...s, status: 'QUEUED', pause_cause: null }))
+    const startSpy = vi.spyOn(ctx.runner, 'startTask')
+    startSpy.mockImplementation(async (taskId: string, input: { workspace_key: string }) => {
+      await ctx.store.updateTaskState(taskId, input.workspace_key, s => ({ ...s, status: 'RUNNING_CLAUDE' }))
+      return { run_id: `run-${taskId}` }
+    })
+    let terminalCalls = 0
+    const terminalSpy = vi.fn(() => { terminalCalls += 1 })
+    ;(ctx.service as unknown as { hooks: { terminal: () => void } }).hooks.terminal = terminalSpy
+    const result = await ctx.service.create('root', ctx.ws)
+    expect(result.reused).toBe(true)
+    const child = await ctx.store.readTaskState(childId, ctx.ws)
+    expect(child.status).toBe('QUEUED')
+    expect(child.queue?.state).toBe('waiting')
+    expect(child.cancel_cause ?? null).toBeNull()
+    // 排队复活不直接 kickAll，交给协调器；但必须触发对账让协调器看到它。
+    expect(startSpy.mock.calls.map(call => String(call[0]))).toEqual([])
+    expect(terminalCalls).toBeGreaterThan(0)
+    // 协调器对账后真的选中并启动这个复活的排队子任务。
+    const coordinator = new QueueCoordinator({ store: ctx.store, runner: ctx.runner })
+    await coordinator.reconcile(ctx.ws)
+    expect(startSpy.mock.calls.map(call => String(call[0]))).toContain(childId)
+    expect((await ctx.store.readTaskState(childId, ctx.ws)).status.startsWith('RUNNING')).toBe(true)
+    startSpy.mockRestore()
+  })
 })

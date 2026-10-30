@@ -54,6 +54,7 @@ const ACTORS = [
 ] as const
 
 export class BuddyStore {
+  private readonly stateWrites = new Map<string, Promise<void>>()
   constructor(public readonly dataRoot: string) {}
 
   async getTasks(): Promise<Task[]> {
@@ -252,8 +253,10 @@ export class BuddyStore {
     workspaceKey: string,
     update: (state: TaskState) => TaskState
   ): Promise<TaskState> {
-    const next = update(await this.readTaskState(taskId, workspaceKey))
-    return this.writeTaskState(taskId, workspaceKey, next)
+    return this.withTaskStateLock(taskId, workspaceKey, async () => {
+      const next = update(await this.readTaskState(taskId, workspaceKey))
+      return this.writeTaskState(taskId, workspaceKey, next)
+    })
   }
 
   async appendTaskEvent(
@@ -261,27 +264,29 @@ export class BuddyStore {
     workspaceKey: string,
     event: Omit<Event, 'seq' | 'ts'> & Partial<Pick<Event, 'seq' | 'ts'>>
   ): Promise<Event> {
-    const events = await this.readEvents(taskId, workspaceKey)
-    const state = await this.readTaskState(taskId, workspaceKey)
-    const next: Event = {
-      seq: event.seq ?? Math.max(
-        state.event_seq ?? 0,
-        events.reduce((max, item) => Math.max(max, item.seq), 0)
-      ) + 1,
-      task_id: taskId,
-      ts: event.ts ?? utcNow(),
-      type: event.type,
-      actor: event.actor,
-      run_id: event.run_id,
-      payload: event.payload
-    }
-    const redacted = redactJsonValue(next)
-    await appendEventLine(this.eventsPath(taskId, workspaceKey), redacted)
-    await this.writeTaskState(taskId, workspaceKey, {
-      ...state,
-      event_seq: next.seq
+    return this.withTaskStateLock(taskId, workspaceKey, async () => {
+      const events = await this.readEvents(taskId, workspaceKey)
+      const state = await this.readTaskState(taskId, workspaceKey)
+      const next: Event = {
+        seq: event.seq ?? Math.max(
+          state.event_seq ?? 0,
+          events.reduce((max, item) => Math.max(max, item.seq), 0)
+        ) + 1,
+        task_id: taskId,
+        ts: event.ts ?? utcNow(),
+        type: event.type,
+        actor: event.actor,
+        run_id: event.run_id,
+        payload: event.payload
+      }
+      const redacted = redactJsonValue(next)
+      await appendEventLine(this.eventsPath(taskId, workspaceKey), redacted)
+      await this.writeTaskState(taskId, workspaceKey, {
+        ...state,
+        event_seq: next.seq
+      })
+      return redacted
     })
-    return redacted
   }
 
   async appendTranscript(
@@ -291,24 +296,26 @@ export class BuddyStore {
     content: string,
     meta: Record<string, unknown> = {}
   ): Promise<TranscriptEntry> {
-    const state = await this.readTaskState(taskId, workspaceKey)
-    const seq = (state.transcript_seq ?? 0) + 1
-    const row = {
-      seq,
-      ts: utcNow(),
-      role,
-      content,
-      meta
-    }
-    await atomicAppendText(
-      this.transcriptJsonlPath(taskId, workspaceKey),
-      `${stringifyPythonJsonLine(row)}\n`
-    )
-    await this.writeTaskState(taskId, workspaceKey, {
-      ...state,
-      transcript_seq: seq
+    return this.withTaskStateLock(taskId, workspaceKey, async () => {
+      const state = await this.readTaskState(taskId, workspaceKey)
+      const seq = (state.transcript_seq ?? 0) + 1
+      const row = {
+        seq,
+        ts: utcNow(),
+        role,
+        content,
+        meta
+      }
+      await atomicAppendText(
+        this.transcriptJsonlPath(taskId, workspaceKey),
+        `${stringifyPythonJsonLine(row)}\n`
+      )
+      await this.writeTaskState(taskId, workspaceKey, {
+        ...state,
+        transcript_seq: seq
+      })
+      return row
     })
-    return row
   }
 
   async enqueueInstruction(
@@ -355,14 +362,16 @@ export class BuddyStore {
     taskId: string,
     workspaceKey: string
   ): Promise<InstructionQueueItem[]> {
-    const state = await this.readTaskState(taskId, workspaceKey)
-    const items = state.instruction_queue ?? []
-    if (items.length === 0) return []
-    await this.writeTaskState(taskId, workspaceKey, {
-      ...state,
-      instruction_queue: []
+    return this.withTaskStateLock(taskId, workspaceKey, async () => {
+      const state = await this.readTaskState(taskId, workspaceKey)
+      const items = state.instruction_queue ?? []
+      if (items.length === 0) return []
+      await this.writeTaskState(taskId, workspaceKey, {
+        ...state,
+        instruction_queue: []
+      })
+      return items
     })
-    return items
   }
 
   taskDirectory(taskId: string, workspaceKey: string): string {
@@ -392,6 +401,7 @@ export class BuddyStore {
     if (!raw.trim()) return null
 
     const events: RoundEventEntry[] = []
+    const acpToolCalls = new Map<string, RoundEventEntry>()
     let inputTokens = 0
     let outputTokens = 0
     let cacheReadTokens = 0
@@ -607,8 +617,14 @@ export class BuddyStore {
         const name = (event.toolName ?? event.name) as string
         const input = (event.toolInput ?? event.input) as Record<string, unknown> | undefined
         if (name) {
-          events.push({ type: 'tool_use', toolName: name, toolInput: input })
+          const row: RoundEventEntry = { type: 'tool_use', toolName: name, toolInput: input }
+          events.push(row)
+          if (typeof event.toolCallId === 'string') acpToolCalls.set(event.toolCallId, row)
         }
+      }
+      if (event.type === 'acp.tool_update' && typeof event.toolCallId === 'string') {
+        const row = acpToolCalls.get(event.toolCallId)
+        if (row) { row.toolInput = event.toolInput as Record<string, unknown>; row.toolName = String(event.toolName ?? row.toolName) }
       }
       if (event.type === 'acp.tool_result') {
         const preview = (event.toolResultPreview ?? event.preview ?? (typeof event.result === 'string' ? event.result : JSON.stringify(event.result))) as string | undefined
@@ -878,6 +894,19 @@ export class BuddyStore {
         return []
       }
     })
+  }
+
+  // Lock order: derivation lock -> this task's state lock. These callbacks only
+  // read/write persistence and must never acquire a derivation lock or call a
+  // public state-writing method recursively. writeTaskState itself stays unlocked.
+  private withTaskStateLock<T>(taskId: string, workspaceKey: string, update: () => Promise<T>): Promise<T> {
+    const key = this.statePath(taskId, workspaceKey)
+    const previous = this.stateWrites.get(key) ?? Promise.resolve()
+    const run = previous.then(update, update)
+    const settled = run.then(() => undefined, () => undefined)
+    this.stateWrites.set(key, settled)
+    void settled.then(() => { if (this.stateWrites.get(key) === settled) this.stateWrites.delete(key) })
+    return run
   }
 
   private async writeTaskState(taskId: string, workspaceKey: string, state: TaskState): Promise<TaskState> {

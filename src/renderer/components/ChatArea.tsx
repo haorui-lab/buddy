@@ -2,6 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ListOrdered, CornerDownRight, Trash2, Sparkles, Plus, FileCode2, FileText, File, FileJson, FileArchive, FileSpreadsheet, Image as ImageIcon } from 'lucide-react'
 import { Task, TaskDetail, InstructionQueueItem, Attachment, AttachmentMeta } from '../../shared/types'
 import { MessageBubble } from './MessageBubble'
+import { DerivationNotice } from './DerivationNotice'
+import { DerivationTaskBar } from './DerivationTaskBar'
+import { derivationTimeline } from '../lib/derivationTimeline'
 import { RunningStatusMessage, RunningDetailPanel } from './RunningStatusMessage'
 import { Composer } from './Composer'
 import { QueueMenu } from './InstructionQueue'
@@ -185,6 +188,7 @@ export function ChatArea({ task, hasAnyTasks, onSendMessage, onStartTask, onInte
     setShowScrollBtn(false)
   }, [task?.task_id])
 
+  const timeline = useMemo(() => task ? derivationTimeline(task.transcript, task.state) : [], [task?.transcript, task?.state.status, task?.state.active_run])
   const isReady = isTaskReadyToStart(task?.state)
   const hasTranscript = (task?.transcript?.length ?? 0) > 0
   const taskText = (task?.task_text || '').trim()
@@ -192,6 +196,7 @@ export function ChatArea({ task, hasAnyTasks, onSendMessage, onStartTask, onInte
 
   return (
     <div className="flex-1 flex flex-col bg-bg-elevated min-w-0">
+      {task && <DerivationTaskBar task={task} tasks={tasks} onSelectTask={onSelectTask} />}
       <div ref={transcriptRef} className="flex-1 overflow-y-auto px-6 py-4 min-h-0">
         {!task ? (
           !hasAnyTasks ? (
@@ -221,47 +226,20 @@ export function ChatArea({ task, hasAnyTasks, onSendMessage, onStartTask, onInte
           )
         ) : (
           <>
-            {task.state.parent_task_id && (
-              <button
-                type="button"
-                onClick={() => onSelectTask?.(task.state.parent_task_id!, task.workspace_key)}
-                className="mb-3 text-xs text-fg-secondary hover:text-fg"
-              >
-                {t('derivation.backToParent')}
-              </button>
-            )}
-            {(task.state.work_dir || task.state.delivery || task.state.acceptance || tasks.some(item => item.parent_task_id === task.task_id)) && (
-              <div className="mb-3 rounded-lg border border-border px-3 py-2 text-xs text-fg-secondary space-y-1">
-                {task.state.work_dir && <div>{t('derivation.workDir')}：{task.state.work_dir}</div>}
-                {task.state.delivery && (
-                  <div>
-                    {t('derivation.delivery')}：{task.state.delivery.version}
+            {(task.state.work_dir || task.state.delivery || task.state.acceptance) && (
+              <details className="mb-3 rounded-lg border border-border px-3 py-2 text-xs text-fg-secondary">
+                <summary className="cursor-pointer hover:text-fg">{t('derivation.deliveryDetails')}</summary>
+                <div className="mt-2 space-y-2 break-words">
+                  {task.state.work_dir && <div>{t('derivation.workDir')}：{task.state.work_dir}</div>}
+                  {task.state.delivery && <div>{t('derivation.delivery')}：{task.state.delivery.version}
                     {task.state.delivery.verification ? ` · ${task.state.delivery.verification}` : ''}
                     {task.state.delivery.open_issues ? ` · ${task.state.delivery.open_issues}` : ''}
-                  </div>
-                )}
-                {task.state.acceptance && (
-                  <div>
-                    {t('derivation.acceptance')}：{task.state.acceptance.decision === 'accept' ? t('status.DONE') : task.state.acceptance.comment}
+                  </div>}
+                  {task.state.acceptance && <div>{t('derivation.acceptance')}：{task.state.acceptance.decision === 'accept' ? t('status.DONE') : task.state.acceptance.comment}
                     {task.state.acceptance.decision === 'accept' && task.state.acceptance.comment ? ` · ${task.state.acceptance.comment}` : ''}
-                  </div>
-                )}
-                {tasks.some(item => item.parent_task_id === task.task_id) && (
-                  <div className="space-y-1">
-                    <div>{t('derivation.children')}</div>
-                    {tasks.filter(item => item.parent_task_id === task.task_id && item.workspace_key === task.workspace_key).map(child => (
-                      <button
-                        key={child.task_id}
-                        type="button"
-                        onClick={() => onSelectTask?.(child.task_id, child.workspace_key)}
-                        className="block text-left hover:text-fg"
-                      >
-                        {child.title || child.task_id} · {t(`status.${child.status}` as 'status.READY')}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
+                  </div>}
+                </div>
+              </details>
             )}
             {showTaskBrief && (
               <div className="flex mb-3 justify-start">
@@ -284,10 +262,12 @@ export function ChatArea({ task, hasAnyTasks, onSendMessage, onStartTask, onInte
                 </div>
               </div>
             )}
-            {task.transcript.map((entry, index) => (
+            {timeline.map(item => item.derivation ? (
+              <DerivationNotice key={item.key} entries={item.entries} events={task.events} tasks={tasks} workspaceKey={task.workspace_key} onSelectTask={onSelectTask} />
+            ) : (
               <MessageBubble
-                key={index}
-                entry={entry}
+                key={item.key}
+                entry={item.entries[0]}
                 taskId={task.task_id}
                 workspaceKey={task.workspace_key}
                 onRetryHealthCheck={onRetryHealthCheck}

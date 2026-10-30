@@ -112,8 +112,9 @@ export function blocksParentCompletion(child: { status: TaskStatus; waived?: boo
 }
 
 /** 父任务必须亲自处理的结果。交付了但子任务还在跑，只是内部确认还没结束，不算。 */
-export function childResultNeedsParent(child: { status: TaskStatus }): boolean {
+export function childResultNeedsParent(child: { status: TaskStatus; last_error?: unknown; latest_failure?: unknown }): boolean {
   return child.status === 'AWAITING_ACCEPTANCE' || child.status === 'FAILED' || child.status === 'CANCELLED'
+    || (child.status === 'PAUSED' && Boolean(child.last_error || child.latest_failure))
 }
 
 /** 必要子任务未验收通过时，父任务不能结束。子任务要先提交交付，双方确认后才进入待验收。 */
@@ -147,6 +148,7 @@ export function formatDerivationSection(input: {
     task_id: string
     title?: string
     status: string
+    unreadable?: boolean
     work_dir?: string
     delivery?: TaskState['delivery']
     acceptance?: TaskState['acceptance']
@@ -171,7 +173,7 @@ export function formatDerivationSection(input: {
       : ''
     const waived = child.waived ? '；已解除必要性' : ''
     const version = child.delivery?.version ? `；交付版本 ${child.delivery.version}` : ''
-    lines.push(`- ${child.task_id} ${child.title || ''} 状态 ${child.status}${child.work_dir ? `；目录 ${child.work_dir}` : ''}${version}${review}${waived}`)
+    lines.push(`- ${child.task_id} ${child.title || ''} 状态 ${child.unreadable ? '损坏（无法读取状态）' : child.status}${child.work_dir ? `；目录 ${child.work_dir}` : ''}${version}${review}${waived}`)
   }
   lines.push('', '当前方案确认进度：')
   if (!input.proposal || input.proposal.status === 'rejected') {
@@ -371,7 +373,7 @@ export class DerivationService {
           waived: Boolean(child.waiver?.reason)
         })
       } catch {
-        children.push({ task_id: childId, status: 'MISSING' })
+        children.push({ task_id: childId, status: 'FAILED', unreadable: true })
       }
     }
     return formatDerivationSection({
@@ -484,6 +486,10 @@ export class DerivationService {
       const proposal = state.derivation_proposal
       if (!proposal || proposal.status === 'rejected') throw new Error('没有可创建的派生方案')
       if (proposal.status === 'created' && proposal.created_task_ids.length > 0) {
+        // 方案写成 created 之后、kickAll 之前，父任务仍可能被暂停并触发创建回滚，
+        // 把这批新子任务取消。早退前必须逐个检查：有 creation_rollback 的先复活再返回，
+        // 否则 reused 会交回一批永远不启动的 CANCELLED，挡死父任务结束。
+        await this.reviveRolledBackChildren(proposal.created_task_ids, taskId, workspaceKey, state)
         return { task_ids: proposal.created_task_ids, reused: true }
       }
       // 这一次创建在开始时已经通过权限复核，中途关掉嵌套开关不打断它。
@@ -525,6 +531,14 @@ export class DerivationService {
           const detail = await this.store.getTaskDetail(childId, workspaceKey)
           if (detail.task_text.trim() !== taskTextOf(spec, taskId).trim()) {
             throw new Error(`子任务标识 ${spec.key} 已有不同内容的任务，新方案不能沿用旧任务`)
+          }
+          if (existing.status === 'CANCELLED') {
+            // 创建中途父任务停止时被系统回滚取消的子任务，重试时复活。
+            // 用户主动取消的不能被这次重试悄悄拉起。
+            if (existing.cancel_cause !== 'creation_rollback') {
+              throw new Error(`子任务 ${childId} 已被用户取消，不能通过重新创建拉起。需要放弃的话请用 waive ${childId} 写明原因解除必要性`)
+            }
+            await this.reviveRolledBackChildren([childId], taskId, workspaceKey, state)
           }
           created.push(childId)
           continue
@@ -568,6 +582,8 @@ export class DerivationService {
           ready.push(childId)
         }
       }
+      // kickAll 只负责启动 READY 的子任务。复活后立即被并发暂停（PAUSED）的子任务
+      // 留给用户显式恢复，kickAll 轮询到 PAUSED 即视为已处理，不会误报失败。
       await stopIfParentClosed()
       if ((state.execution_mode ?? 'immediate') === 'queued') {
         this.hooks.terminal(workspaceKey)
@@ -579,21 +595,7 @@ export class DerivationService {
   }
 
   async wait(taskId: string, workspaceKey: string): Promise<{ waiting: boolean; deferred: boolean }> {
-    const state = await this.store.readTaskState(taskId, workspaceKey)
-    this.assertMutable(state)
-    if ((state.child_task_ids ?? []).length === 0) throw new Error('当前任务还没有子任务，不能等待')
-    if (state.active_run) {
-      await this.lock(`${workspaceKey}:${taskId}`, async () => {
-        await this.store.updateTaskState(taskId, workspaceKey, current => ({
-          ...current,
-          derivation_hold: 'children',
-          updated_at: utcNow()
-        }))
-      })
-      return { waiting: false, deferred: true }
-    }
-    await this.enterWait(taskId, workspaceKey)
-    return { waiting: true, deferred: false }
+    return this.lock(`${workspaceKey}:${taskId}`, () => this.enterWait(taskId, workspaceKey))
   }
 
   submit(taskId: string, workspaceKey: string, actor: string, input: {
@@ -604,7 +606,7 @@ export class DerivationService {
   }): Promise<TaskDelivery> {
     return this.lock(`${workspaceKey}:${taskId}`, async () => {
       const state = await this.store.readTaskState(taskId, workspaceKey)
-      if (state.status === 'CANCELLED') throw new Error('任务已取消，不能提交')
+      this.assertMutable(state)
       if (!state.parent_task_id) throw new Error('只有子任务需要向父任务提交交付')
       const version = (input.version || '').trim() || await this.headVersion(state.work_dir) || 'unversioned'
       const delivery: TaskDelivery = {
@@ -615,11 +617,10 @@ export class DerivationService {
         submitted_at: utcNow(),
         submitted_by: actor
       }
-      await this.store.updateTaskState(taskId, workspaceKey, current => ({
-        ...current,
-        delivery,
-        updated_at: utcNow()
-      }))
+      await this.store.updateTaskState(taskId, workspaceKey, current => {
+        this.assertMutable(current)
+        return { ...current, delivery, acceptance: null, updated_at: utcNow() }
+      })
       await this.note(taskId, workspaceKey, 'derivation.submitted', `${actor} 提交了交付，版本 ${version}。`, { version })
       await this.notifyParent(taskId, workspaceKey, `子任务 ${state.title || taskId} 已提交交付。版本 ${version}。验证：${delivery.verification || '未填写'}。未解决问题：${delivery.open_issues || '无'}。`, false)
       return delivery
@@ -737,17 +738,32 @@ export class DerivationService {
       if (child.parent_task_id !== parentId) throw new Error('子任务的父任务不匹配')
       if (child.status === 'CANCELLED') throw new Error('子任务已取消，不能重启')
       if (child.status !== 'FAILED') throw new Error('只有失败的子任务可以重启')
-      await this.store.updateTaskState(childId, workspaceKey, current => ({
-        ...current,
-        status: 'READY',
-        consecutive_failures: 0,
-        active_run: null,
-        pending_break: null,
-        break_rejected_by: null,
-        countdown: null,
-        pause_cause: null,
-        updated_at: utcNow()
-      }))
+      const global = await this.store.readGlobalSettings()
+      const maximum = global.max_consecutive_failures ?? 10
+      if ((child.consecutive_failures ?? 0) >= maximum) throw new Error(`子任务连续失败已达到上限 (${maximum})，请先处理执行器问题`)
+
+      let restarted = false
+      await this.store.updateTaskState(childId, workspaceKey, current => {
+        // 锁外读到的 FAILED 只是快照。子任务自己的启动不拿父任务的派生锁，
+        // 回调里必须复核：已经变化的状态不能被这次重启覆盖。
+        // 判据是「不再是 FAILED」：迟到的启动可能已经写了 active_run 而状态仍是 FAILED，
+        // 那是启动流程中途的落盘顺序，同样不该被重启打断。
+        if (current.status !== 'FAILED') return current
+        restarted = true
+        return {
+          ...current,
+          status: 'READY',
+          active_run: null,
+          pending_break: null,
+          break_rejected_by: null,
+          countdown: null,
+          pause_cause: null,
+          updated_at: utcNow()
+        }
+      })
+      if (!restarted) {
+        throw new Error('子任务状态在重启前发生了变化，没有执行重启')
+      }
       await this.note(childId, workspaceKey, 'derivation.restarted', `${actor} 重新启动了失败的子任务。`, { actor })
       await this.note(parentId, workspaceKey, 'derivation.restarted', `重新启动子任务 ${child.title || childId}。`, { child_task_id: childId })
       void this.hooks.startTask(childId, workspaceKey).catch(error => {
@@ -767,23 +783,19 @@ export class DerivationService {
       await this.note(parentId, workspaceKey, failure ? 'derivation.child_failed' : 'derivation.child_delivered', message, { child_task_id: childId })
       if (!childResultNeedsParent(child)) return
       if (parent.pause_cause === 'user') return
-      if (parent.status === 'WAITING_CHILDREN') {
-        await this.store.updateTaskState(parentId, workspaceKey, current => ({
-          ...current,
-          status: 'READY',
-          derivation_hold: null,
-          derivation_wake_pending: null,
-          updated_at: utcNow()
-        }))
+      let wake = false
+      await this.store.updateTaskState(parentId, workspaceKey, current => {
+        if (['DONE', 'CANCELLED', 'AWAITING_ACCEPTANCE'].includes(current.status) || current.pause_cause === 'user') return current
+        if (current.status === 'WAITING_CHILDREN' && !current.active_run) {
+          wake = true
+          return { ...current, status: 'READY', derivation_hold: null, derivation_wake_pending: null, updated_at: utcNow() }
+        }
+        return { ...current, derivation_wake_pending: true, updated_at: utcNow() }
+      })
+      if (wake) {
         void this.hooks.startTask(parentId, workspaceKey).catch(() => {})
         this.hooks.terminal(workspaceKey)
-        return
       }
-      await this.store.updateTaskState(parentId, workspaceKey, current => ({
-        ...current,
-        derivation_wake_pending: true,
-        updated_at: utcNow()
-      }))
     })
   }
 
@@ -791,7 +803,7 @@ export class DerivationService {
     const state = await this.store.readTaskState(taskId, workspaceKey)
     for (const childId of state.child_task_ids ?? []) {
       const child = await this.store.readTaskState(childId, workspaceKey).catch(() => null)
-      if (child && childResultNeedsParent(child)) return true
+      if (!child || childResultNeedsParent(child)) return true
     }
     return false
   }
@@ -803,14 +815,13 @@ export class DerivationService {
       if (state.status !== 'WAITING_CHILDREN' || state.pause_cause === 'user') return false
       const ready = Boolean(state.derivation_wake_pending) || await this.childrenNeedParent(taskId, workspaceKey)
       if (!ready) return false
-      await this.store.updateTaskState(taskId, workspaceKey, current => ({
-        ...current,
-        status: 'READY',
-        derivation_hold: null,
-        derivation_wake_pending: null,
-        updated_at: utcNow()
-      }))
-      return true
+      let released = false
+      await this.store.updateTaskState(taskId, workspaceKey, current => {
+        if (current.status !== 'WAITING_CHILDREN' || current.pause_cause === 'user' || current.active_run) return current
+        released = true
+        return { ...current, status: 'READY', derivation_hold: null, derivation_wake_pending: null, updated_at: utcNow() }
+      })
+      return released
     })
   }
 
@@ -914,38 +925,34 @@ export class DerivationService {
     if (state.status === 'DONE') throw new Error('任务已结束')
   }
 
-  private async enterWait(taskId: string, workspaceKey: string): Promise<void> {
-    await this.lock(`${workspaceKey}:${taskId}`, async () => {
-      const current = await this.store.readTaskState(taskId, workspaceKey)
-      const wake = current.pause_cause !== 'user' && (
-        Boolean(current.derivation_wake_pending) || await this.childrenNeedParent(taskId, workspaceKey)
-      )
-      if (wake) {
-        await this.store.updateTaskState(taskId, workspaceKey, state => ({
-          ...state,
-          status: 'READY',
-          derivation_hold: null,
-          derivation_wake_pending: null,
-          active_run: null,
-          countdown: null,
-          updated_at: utcNow()
-        }))
-        void this.hooks.startTask(taskId, workspaceKey).catch(() => {})
-        this.hooks.terminal(workspaceKey)
-        return
+  /** Called only under the derivation lock; the state callback checks the latest snapshot. */
+  private async enterWait(taskId: string, workspaceKey: string): Promise<{ waiting: boolean; deferred: boolean }> {
+    const ready = await this.childrenNeedParent(taskId, workspaceKey)
+    let deferred = false
+    let wake = false
+    await this.store.updateTaskState(taskId, workspaceKey, current => {
+      this.assertMutable(current)
+      if (current.status === 'AWAITING_ACCEPTANCE') throw new Error('任务正在等待验收，不能等待子任务')
+      if (current.status === 'PAUSED' && current.pause_cause === 'user') throw new Error('任务已由用户暂停')
+      if (!(current.child_task_ids ?? []).length) throw new Error('当前任务还没有子任务，不能等待')
+      if (current.active_run) {
+        deferred = true
+        return { ...current, derivation_hold: 'children', updated_at: utcNow() }
       }
-      await this.store.updateTaskState(taskId, workspaceKey, state => ({
-        ...state,
-        status: 'WAITING_CHILDREN',
-        derivation_hold: null,
-        derivation_wake_pending: null,
-        active_run: null,
-        countdown: null,
-        updated_at: utcNow()
-      }))
-      await this.note(taskId, workspaceKey, 'derivation.waiting', '父任务开始等待子任务，不再占用执行名额。', {})
-      this.hooks.terminal(workspaceKey)
+      wake = ready || Boolean(current.derivation_wake_pending)
+      return {
+        ...current, status: wake ? 'READY' : 'WAITING_CHILDREN',
+        derivation_hold: null, derivation_wake_pending: null, countdown: null, updated_at: utcNow()
+      }
     })
+    if (deferred) return { waiting: false, deferred: true }
+    if (wake) {
+      void this.hooks.startTask(taskId, workspaceKey).catch(() => {})
+    } else {
+      await this.note(taskId, workspaceKey, 'derivation.waiting', '父任务开始等待子任务，不再占用执行名额。', {})
+    }
+    this.hooks.terminal(workspaceKey)
+    return { waiting: !wake, deferred: false }
   }
 
   private async kickAll(taskIds: string[], workspaceKey: string): Promise<void> {
@@ -1006,6 +1013,93 @@ export class DerivationService {
       if (isEnoent(error)) return { kind: 'missing' }
       return { kind: 'unreadable' }
     }
+  }
+
+  /**
+   * 复活被创建回滚取消的子任务：回调内复核最新快照，仍在 CANCELLED + creation_rollback
+   * 才按子任务自己的执行模式复活——queued（或有依赖）回 QUEUED + queue.state=waiting，
+   * 交给排队协调器按顺序拉起；immediate 回 READY 并立即 kickAll。
+   * 用户取消、或状态已被并发改动的子任务不在本方法职责内：调用方已先行校验。
+   * 只在派生锁内调用；这里不拿任何子任务自己的派生锁，也不会重入状态锁以外的公共写方法。
+   */
+  private async reviveRolledBackChildren(
+    childIds: string[],
+    parentId: string,
+    workspaceKey: string,
+    parentState: Pick<TaskState, 'execution_mode'>
+  ): Promise<void> {
+    const revived: string[] = []
+    for (const childId of childIds) {
+      const child = await this.store.readTaskState(childId, workspaceKey).catch(() => null)
+      if (!child || child.status !== 'CANCELLED' || child.cancel_cause !== 'creation_rollback') continue
+      let restored = false
+      let queuedRevive = false
+      await this.store.updateTaskState(childId, workspaceKey, current => {
+        if (current.status !== 'CANCELLED' || current.cancel_cause !== 'creation_rollback') return current
+        restored = true
+        // 复活目标按子任务自己的执行模式选：排队任务回 QUEUED（协调器只挑
+        // QUEUED + queue.state=waiting 的任务），立即任务回 READY 由 kickAll 启动。
+        // 有依赖的两种模式都先回 QUEUED，等依赖完成后由 kickUnblocked 按模式分流。
+        // queue 记录在取消时可能被弄丢，复活时补回 waiting，否则协调器永远挑不到它。
+        if ((current.execution_mode ?? 'immediate') === 'queued' || current.dependency_blocked) {
+          queuedRevive = true
+          return {
+            ...current,
+            status: 'QUEUED',
+            queue: { ...(current.queue ?? { state: 'waiting' as const, enqueued_at: utcNow() }), state: 'waiting' },
+            cancel_cause: null,
+            active_run: null,
+            countdown: null,
+            pause_cause: null,
+            pause_resume_status: undefined,
+            updated_at: utcNow()
+          }
+        }
+        return {
+          ...current,
+          status: 'READY',
+          cancel_cause: null,
+          active_run: null,
+          countdown: null,
+          pause_cause: null,
+          pause_resume_status: undefined,
+          updated_at: utcNow()
+        }
+      })
+      if (!restored) {
+        // 并发改动赢了对账：不算错误，但要让调用方知道没有复活成功。
+        throw new Error(`子任务 ${childId} 的状态在复活前发生了变化，请重试创建`)
+      }
+      await this.note(childId, workspaceKey, 'derivation.revived', `父任务重试创建，恢复了创建中途被回滚的子任务。`, {})
+      if (!queuedRevive) revived.push(childId)
+    }
+    // 排队复活的子任务交给协调器：terminal() 触发一次对账，协调器按队列顺序
+    // 挑 QUEUED + waiting 的任务启动，不会插队。立即复活的走 kickAll。
+    if (revived.length === 0) {
+      if (childIds.length > 0 && await this.anyRevivedQueued(childIds, workspaceKey)) this.hooks.terminal(workspaceKey)
+      return
+    }
+    if ((parentState.execution_mode ?? 'immediate') === 'queued') {
+      this.hooks.terminal(workspaceKey)
+      return
+    }
+    const ready: string[] = []
+    for (const childId of revived) {
+      const child = await this.store.readTaskState(childId, workspaceKey).catch(() => null)
+      if (child && !child.dependency_blocked && child.status !== 'DONE' && child.status !== 'CANCELLED' && !child.status.startsWith('RUNNING')) {
+        ready.push(childId)
+      }
+    }
+    if (ready.length > 0) await this.kickAll(ready, workspaceKey)
+  }
+
+  /** 复活后是否有任务进了排队队列需要协调器对账。 */
+  private async anyRevivedQueued(childIds: string[], workspaceKey: string): Promise<boolean> {
+    for (const childId of childIds) {
+      const child = await this.store.readTaskState(childId, workspaceKey).catch(() => null)
+      if (child?.status === 'QUEUED' && child.queue?.state === 'waiting') return true
+    }
+    return false
   }
 
   /**
@@ -1081,7 +1175,7 @@ export class DerivationService {
 
   private async unfinishedDescendants(taskId: string, workspaceKey: string, seen = new Set<string>()): Promise<string[]> {
     const state = await this.store.readTaskState(taskId, workspaceKey).catch(() => null)
-    if (!state) return []
+    if (!state) return [taskId]
     const blocked: string[] = []
     for (const childId of state.child_task_ids ?? []) {
       if (seen.has(childId)) continue
@@ -1103,6 +1197,9 @@ export class DerivationService {
         return {
           ...current,
           status: 'CANCELLED',
+          // 标明这是创建中途父任务停止时的系统回滚，不是用户取消。
+          // 父任务恢复后重试 create 时，这类子任务可以复活；用户取消的不能。
+          cancel_cause: 'creation_rollback',
           active_run: null,
           countdown: null,
           updated_at: utcNow()

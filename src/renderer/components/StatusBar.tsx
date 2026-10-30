@@ -432,6 +432,8 @@ function EventLog({ events, t, lang }: { events: Event[]; t: TFunction; lang: La
         const failed =
           event.type?.endsWith('.failed') ||
           event.type?.endsWith('.error') ||
+          event.type === 'derivation.child_failed' ||
+          event.type === 'derivation.start_failed' ||
           Boolean((event.payload || {}).error)
         const summary = eventPayloadSummary(event, lang)
         return (

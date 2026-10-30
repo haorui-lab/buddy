@@ -100,7 +100,20 @@ const EVENT_TYPE_KEY: Record<string, TranslationKey> = {
   'task.queued': 'event.task.queued',
   'queue.activated': 'event.queue.activated',
   'queue.blocked': 'event.queue.blocked',
-  'queue.superseded': 'event.queue.superseded'
+  'queue.superseded': 'event.queue.superseded',
+  'derivation.proposed': 'derivation.event.proposed',
+  'derivation.decided': 'derivation.event.decided',
+  'derivation.created': 'derivation.event.created',
+  'derivation.submitted': 'derivation.event.submitted',
+  'derivation.reviewed': 'derivation.event.reviewed',
+  'derivation.waived': 'derivation.event.waived',
+  'derivation.restarted': 'derivation.event.restarted',
+  'derivation.waiting': 'derivation.event.waiting',
+  'derivation.child_failed': 'derivation.event.child_failed',
+  'derivation.child_delivered': 'derivation.event.child_delivered',
+  'derivation.start_failed': 'derivation.event.start_failed',
+  'task.completion_blocked': 'derivation.event.completion_blocked',
+  'task.failure_restored': 'derivation.event.failure_restored',
 }
 
 /**

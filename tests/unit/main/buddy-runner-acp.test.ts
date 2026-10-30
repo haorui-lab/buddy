@@ -102,6 +102,46 @@ describe('BuddyRunner with ACP protocol', () => {
     expect(transcriptRow.content).toBe('Hello from ACP agent!')
   })
 
+  it('retains failed-turn session, partial output, refined inputs and tool results', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'buddy-acp-partial-'))
+    const fake = join(root, 'partial.cjs')
+    await writeFile(fake, `
+      const rl=require('node:readline').createInterface({input:process.stdin});
+      const send=x=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',...x})+'\\n');
+      rl.on('line',line=>{const r=JSON.parse(line);
+        if(r.method==='initialize') send({id:r.id,result:{protocolVersion:1}});
+        else if(r.method==='session/new') send({id:r.id,result:{sessionId:'partial-session'}});
+        else if(r.method==='session/prompt') {
+          const update=u=>send({method:'session/update',params:{sessionId:'partial-session',update:u}});
+          update({sessionUpdate:'agent_message_chunk',content:{type:'text',text:'partial progress'}});
+          update({sessionUpdate:'tool_call',toolCallId:'t1',title:'Read',rawInput:{}});
+          update({sessionUpdate:'tool_call_update',toolCallId:'t1',rawInput:{file_path:'/tmp/input.txt'}});
+          update({sessionUpdate:'tool_call_update',toolCallId:'t1',status:'completed',rawOutput:'file data'});
+          send({id:r.id,error:{code:-32603,message:'Stream ended without receiving any events'}});
+        }
+      });
+    `)
+    const store = new BuddyStore(root)
+    const created = await store.createTask({ task_id: 'partial', repo_root: root, settings: { launchers: {
+      opencode: { protocol: 'acp', command: process.execPath, args: [fake], env: {}, timeout_seconds: 5 }
+    } } })
+    const runner = new BuddyRunner(store)
+    await expect(runner.startTask('partial', { workspace_key: created.workspace_key, actor: 'opencode' })).rejects.toThrow(/Stream ended/)
+    const detail = await store.getTaskDetail('partial', created.workspace_key)
+    expect(detail.state.status).toBe('FAILED')
+    expect(detail.state.actor_sessions?.opencode).toBe('partial-session')
+    expect(detail.state.opencode_session_id).toBe('partial-session')
+    expect(detail.transcript).toEqual(expect.arrayContaining([expect.objectContaining({ role: 'opencode', content: 'partial progress', meta: expect.objectContaining({ partial: true, kind: 'actor_partial' }) })]))
+    const runId = detail.events.find(e => e.type === 'actor.started')!.run_id!
+    expect(await readFile(join(store.taskDirectory('partial', created.workspace_key), 'artifacts', `${runId}-output.md`), 'utf8')).toBe('partial progress')
+    const round = await store.getRoundEvents('partial', runId, created.workspace_key)
+    const calls = round!.events.filter(e => e.type === 'tool_use')
+    expect(calls).toHaveLength(1)
+    expect(calls[0].toolInput).toEqual({ file_path: '/tmp/input.txt' })
+    expect(round!.events.find(e => e.type === 'tool_result')?.toolResultPreview).toBe('file data')
+    expect(detail.events.find(e => e.type === 'actor.failed')?.payload).toMatchObject({ tool_calls: 1, tool_updates: 1, tool_results: 1 })
+  })
+
   it('handles buddy_propose_break tool invocation and marks pending break', async () => {
     const root = await mkdtemp(join(tmpdir(), 'buddy-runner-acp-break-'))
     const fakeAcpServer = join(root, 'fake-acp-break-agent.js')

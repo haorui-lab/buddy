@@ -23,6 +23,7 @@ export interface AcpPromptHandlers {
   onContentDelta?: (text: string) => void
   onThinkingDelta?: (thinking: string) => void
   onToolCall?: (id: string, name: string, input: Record<string, unknown>) => void
+  onToolCallUpdate?: (id: string, name: string, input: Record<string, unknown>) => void
   onToolResult?: (id: string, result: unknown, isError?: boolean) => void
   onBreak?: (reason?: string) => void
   /**
@@ -57,6 +58,8 @@ export class AcpClient {
     }
   >()
   private activePromptHandlers: AcpPromptHandlers | null = null
+  private activePromptSessionId: string | null = null
+  private readonly toolCalls = new Map<string, { name: string; input: Record<string, unknown> }>()
   private readonly unsubscribeTransport: () => void
   private readonly unsubscribeClose: () => void
   private readonly unsubscribeError: () => void
@@ -153,6 +156,7 @@ export class AcpClient {
         break
 
       case 'session/update': {
+        if (typeof data?.sessionId === 'string' && data.sessionId !== this.activePromptSessionId) break
         const update = (data?.update ?? data) as Record<string, unknown> | undefined
         if (!update) break
 
@@ -176,13 +180,22 @@ export class AcpClient {
           const toolCallId = String(update.toolCallId ?? update.id ?? '')
           const name = String(update.name ?? update.title ?? 'tool')
           const input = (update.rawInput ?? update.input ?? {}) as Record<string, unknown>
+          this.toolCalls.set(toolCallId, { name, input })
           handlers.onToolCall?.(toolCallId, name, input)
         } else if (sessionUpdate === 'tool_call_update') {
           const toolCallId = String(update.toolCallId ?? update.id ?? '')
-          const content = update.content
+          const previous = this.toolCalls.get(toolCallId)
+          if (update.rawInput !== undefined || update.input !== undefined || update.title !== undefined || update.name !== undefined) {
+            const name = String(update.name ?? update.title ?? previous?.name ?? 'tool')
+            const input = (update.rawInput ?? update.input ?? previous?.input ?? {}) as Record<string, unknown>
+            this.toolCalls.set(toolCallId, { name, input })
+            handlers.onToolCallUpdate?.(toolCallId, name, input)
+          }
+          const content = update.rawOutput ?? update.content
           const status = update.status
-          if (status === 'completed' || status === 'error') {
-            handlers.onToolResult?.(toolCallId, content, status === 'error')
+          if (status === 'completed' || status === 'failed' || status === 'error') {
+            handlers.onToolResult?.(toolCallId, content, status !== 'completed')
+            this.toolCalls.delete(toolCallId)
           }
         }
 
@@ -311,9 +324,10 @@ export class AcpClient {
    * Perform handshake with the ACP Agent
    */
   async initialize(customParams?: Partial<AcpInitializeParams>): Promise<AcpInitializeResult> {
+    // The agent owns its filesystem and shell tools. Advertising host RPCs here
+    // would route tools to methods that handleHostRequest does not implement.
     const clientCapabilities: AcpClientCapabilities = {
-      fs: { readTextFile: true, writeTextFile: true },
-      terminal: true
+      fs: { readTextFile: false, writeTextFile: false }, terminal: false
     }
     const params: AcpInitializeParams = {
       protocolVersion: 1,
@@ -380,7 +394,10 @@ export class AcpClient {
    * Send a prompt to the agent, providing the buddy_propose_break tool and streaming notifications
    */
   async prompt(params: AcpPromptParams, handlers?: AcpPromptHandlers): Promise<AcpPromptResult> {
+    if (this.activePromptSessionId) throw new Error('An ACP prompt is already active')
     this.activePromptHandlers = handlers ?? null
+    this.activePromptSessionId = params.sessionId
+    this.toolCalls.clear()
 
     const promptBlocks: AcpContentBlock[] = Array.isArray(params.prompt)
       ? params.prompt
@@ -410,6 +427,8 @@ export class AcpClient {
       })
     } finally {
       this.activePromptHandlers = null
+      this.activePromptSessionId = null
+      this.toolCalls.clear()
     }
   }
 

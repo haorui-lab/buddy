@@ -296,6 +296,24 @@ export class BuddyCoreService {
   async recoverInterruptedRuns(): Promise<void> {
     const tasks = await this.store.getTasks()
     for (const task of tasks) {
+      // Older parent pauses also masked FAILED descendants as PAUSED. Restore
+      // that failure without launching anything or discarding its diagnostics.
+      if (task.status === 'PAUSED') {
+        const snapshot = await this.store.readTaskState(task.task_id, task.workspace_key)
+        if (snapshot.pause_cause !== 'cascade' || snapshot.pause_resume_status !== 'FAILED') continue
+        let restored = false
+        await this.store.updateTaskState(task.task_id, task.workspace_key, state => {
+          if (state.status !== 'PAUSED' || state.pause_cause !== 'cascade' || state.pause_resume_status !== 'FAILED') return state
+          restored = true
+          return { ...state, status: 'FAILED', active_run: null, pause_cause: null, pause_resume_status: undefined }
+        })
+        if (restored) {
+          const event = await this.store.appendTaskEvent(task.task_id, task.workspace_key, {
+            type: 'task.failure_restored', payload: { reason: 'legacy_cascade_pause' }
+          })
+          this.events?.publish({ workspace_key: task.workspace_key, task_id: task.task_id, event })
+        }
+      }
       const wasRunning = task.status.startsWith('RUNNING_') || task.status === 'PINGING'
       if (wasRunning) {
         const event = await this.store.appendTaskEvent(task.task_id, task.workspace_key, {

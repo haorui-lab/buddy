@@ -213,6 +213,8 @@ export function MessageBubble({ entry, taskId, workspaceKey, onRetryHealthCheck,
   const isHuman = entry.role === 'human'
   const meta = entry.meta || ({} as Record<string, unknown>)
   const isRoundNotice = isSystem && meta.kind === 'round_notice'
+  const isCompletionBlocked = isRoundNotice && (meta.completion_blocked === true || entry.content.startsWith('还有子任务未验收通过（'))
+  const isPartialRun = !isSystem && !isHuman && meta.partial === true
   const isHealthCheck = isSystem && (meta.kind === 'health_check' || meta.kind === 'health_check_failed')
   const isHealthCheckFailed = isSystem && meta.kind === 'health_check_failed'
   const metaAttachments = (meta.attachments as AttachmentMeta[] | undefined)
@@ -225,6 +227,7 @@ export function MessageBubble({ entry, taskId, workspaceKey, onRetryHealthCheck,
     const i18nText = renderHealthCheckText(entry, lang)
     if (i18nText) bodyText = i18nText
   }
+  if (isCompletionBlocked) bodyText = t(meta.completion_blocked ? 'derivation.completionPaused' : 'derivation.completionBlocked')
 
   // Resolve attachments: prefer meta.attachments, fall back to parsing from content
   let displayAttachments = metaAttachments
@@ -238,7 +241,7 @@ export function MessageBubble({ entry, taskId, workspaceKey, onRetryHealthCheck,
 
   const html = renderMarkdown(bodyText)
   const cls = roleClasses[entry.role] || 'msg-default'
-  const metaText = formatMessageMeta(entry, lang)
+  const metaText = `${isPartialRun ? `${t('derivation.partialRun')} · ` : ''}${formatMessageMeta(entry, lang)}`
 
   const roleLabel = isRoundNotice || isHealthCheck
     ? t('actor.systemNotice')
@@ -246,7 +249,7 @@ export function MessageBubble({ entry, taskId, workspaceKey, onRetryHealthCheck,
       ? t(ACTOR_LABEL_KEY[entry.role])
       : entry.role
 
-  const noticeClass = isRoundNotice ? 'round-notice' : isHealthCheckFailed ? 'health-check-failed' : isHealthCheck ? 'health-check' : ''
+  const noticeClass = isCompletionBlocked || isHealthCheckFailed || isPartialRun ? 'health-check-failed' : isRoundNotice ? 'round-notice' : isHealthCheck ? 'health-check' : ''
   const isTaskDone = isRoundNotice && meta.done_reason === 'dual_break_confirmed'
   const taskDoneStats = isTaskDone ? (meta.stats as TaskStats | undefined) : undefined
 
@@ -276,6 +279,12 @@ export function MessageBubble({ entry, taskId, workspaceKey, onRetryHealthCheck,
             ) : null}
           </div>
         </div>
+        {isCompletionBlocked && (
+          <details className="mt-2 text-xs text-fg-secondary">
+            <summary className="cursor-pointer w-fit hover:text-fg">{t('derivation.notice.details')}</summary>
+            <div className="message-body mt-2 break-words" dangerouslySetInnerHTML={{ __html: renderMarkdown(entry.content) }} />
+          </details>
+        )}
         {isHealthCheckFailed && onRetryHealthCheck && (
           <div className="mt-2">
             <button

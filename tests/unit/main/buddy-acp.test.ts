@@ -87,6 +87,35 @@ describe('AcpClient', () => {
     expect(result.capabilities.streaming).toBe(true)
   })
 
+  it('does not advertise filesystem/terminal RPCs that the host does not implement', async () => {
+    const transport = new MockAcpTransport()
+    const client = new AcpClient(transport)
+    const pending = client.initialize()
+    const req = transport.sentMessages[0] as JsonRpcRequest
+    const capabilities = (req.params as any).clientCapabilities
+    expect(capabilities.fs?.readTextFile ?? false).toBe(false)
+    expect(capabilities.fs?.writeTextFile ?? false).toBe(false)
+    expect(capabilities.terminal ?? false).toBe(false)
+    transport.simulateMessage({ jsonrpc: '2.0', id: req.id, result: { protocolVersion: 1 } })
+    await pending; await client.close()
+  })
+
+  it('reconciles streamed tool input and recognizes standard failed tool results', async () => {
+    const transport = new MockAcpTransport()
+    const client = new AcpClient(transport)
+    const call = vi.fn(), refined = vi.fn(), result = vi.fn()
+    const pending = client.prompt({ sessionId: 's', prompt: 'read' }, { onToolCall: call, onToolCallUpdate: refined, onToolResult: result })
+    const req = transport.sentMessages[0] as JsonRpcRequest
+    const update = (value: object) => transport.simulateMessage({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 's', update: value } })
+    update({ sessionUpdate: 'tool_call', toolCallId: 'read-1', title: 'Read', status: 'pending' })
+    update({ sessionUpdate: 'tool_call_update', toolCallId: 'read-1', rawInput: { file_path: '/tmp/input.txt' }, status: 'in_progress' })
+    update({ sessionUpdate: 'tool_call_update', toolCallId: 'read-1', status: 'failed', rawOutput: { error: 'denied' }, content: [{ type: 'content', content: { type: 'text', text: 'denied' } }] })
+    expect(refined).toHaveBeenLastCalledWith('read-1', 'Read', { file_path: '/tmp/input.txt' })
+    expect(result).toHaveBeenCalledWith('read-1', expect.anything(), true)
+    transport.simulateMessage({ jsonrpc: '2.0', id: req.id, result: { stopReason: 'end_turn' } })
+    await pending; await client.close()
+  })
+
   it('creates and resumes sessions with mcpServers default', async () => {
     const transport = new MockAcpTransport()
     const client = new AcpClient(transport)

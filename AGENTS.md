@@ -78,6 +78,24 @@ Detects whether a command is a "native" CLI (Codex/codex/opencode/kimi) or a gen
 - 23 preset themes (CSS custom properties), i18n (zh-CN/zh-TW/en with CJK auto-detect).
 - `@` alias maps to `src/renderer` (renderer only; main process uses relative paths).
 
+### Task derivation presentation
+
+- `derivationTimeline.ts` projects the stored transcript for display: group actor-issued derivation receipts after the actor conclusion, defer receipts from the active run, and flush on human instructions, round boundaries, pause or failure. Incoming child results and errors remain immediate. Never reorder persisted transcripts.
+- `DerivationNotice` reuses the existing system notice label and theme classes. Show short localized outcomes and actor display names; preserve complete original reasons and IDs in native expandable details. Event payloads enrich legacy transcript entries that only have `meta.kind`.
+- Legacy completion-blocked round notices use the existing error notice style and a short summary with original IDs/instructions in details. `derivation.start_failed` may be emitted when a long-running `startTask` promise rejects, so label it as an execution error rather than assuming the failure happened during startup.
+- `DerivationTaskBar` keeps parent/child navigation outside the scrolling transcript, scoped by workspace. Preserve live child statuses, titles, and keyboard-accessible buttons. Show a persistent completion-blocked hint only from `task.completion_blocked` evidence; remove resolved children after acceptance/waiver or DONE, and hide the hint for terminal parents.
+- Relevant regression tests: `derivation-timeline.test.ts` and `derivation-notice.test.tsx`; manual checks must cover the running Electron app without restarting or cancelling active tasks.
+
+### Derivation reliability and ACP failures
+
+- All state read/modify/write entry points in `BuddyStore` share a per-task lock, including event/transcript appends and instruction draining. Lock order is derivation lock, then state lock; state callbacks must not reenter either layer. `writeTaskState` is an unlocked primitive used only by those entry points.
+- Recheck current status/active run inside state callbacks for wait, wake, completion and failure. Automatic starts require READY; PAUSED tasks need explicit resume. Double-break with unfinished required children pauses the parent and releases its execution slot, never starts an empty approval loop or bypasses acceptance.
+- Missing/corrupt child state requires parent attention and blocks completion/acceptance. Render it as corruption in prompts without persisting a fake task status. New submissions clear stale acceptance and cannot change DONE/CANCELLED tasks.
+- Parent pause preserves FAILED children. Startup/resume repairs legacy cascade-paused FAILED children without executing them. Actor-requested child restarts preserve consecutive failures and respect the configured ceiling; a successful actor turn clears the failure count.
+- ACP advertises host filesystem/terminal capabilities as false until those RPCs are implemented. Merge `tool_call_update` inputs by ID, recognize `failed` results, and ignore updates from other sessions. These are observation updates, not instructions to execute tools again.
+- Persist established ACP sessions before prompting; keep partial output and ordered event artifacts on failure. Failed turns appear as interrupted/unfinished with inspectable round details. Empty initial tool inputs are not proof of execution failure: inspect refinements/results or the original provider session before diagnosing the provider.
+- Targeted regressions: `buddy-store-concurrency`, `buddy-derivation-reliability`, `buddy-acp`, `buddy-runner-acp`, `buddy-recovery`. `RUN_LIVE_ACP=1 pnpm vitest run tests/live/acp-runtime-smoke.test.ts` performs real tools in a temporary fixture; it does not prove a provider will never drop a long request.
+
 ## Conventions
 
 - **Icons**: Use lucide-react. Do not introduce other icon libraries or custom SVGs.
